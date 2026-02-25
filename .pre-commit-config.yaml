@@ -1,0 +1,32 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.14.14
+    hooks:
+      - id: ruff
+        name: ruff check
+        args: [--fix]
+      - id: ruff-format
+        name: ruff format
+
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy type check
+        language: system
+        entry: uv run mypy
+        types: [python]
+        require_serial: true
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-yaml
+        name: check yaml syntax
+      - id: check-toml
+        name: check toml syntax
+      - id: detect-private-key
+        name: detect private keys (security)
+      - id: trailing-whitespace
+        name: trim trailing whitespace
+      - id: end-of-file-fixer
+        name: ensure files end with newline

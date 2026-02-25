@@ -1,10 +1,28 @@
 # socketry
 
+[![CI](https://github.com/jlopez/socketry/actions/workflows/ci.yml/badge.svg)](https://github.com/jlopez/socketry/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue)
+
 Python API and CLI for controlling Jackery portable power stations.
 
 Reverse-engineered from the Jackery Android APK (v1.0.7) and iOS app (v1.2.0).
 Communicates via Jackery's cloud MQTT broker and HTTP API — no modifications to
 the device or its firmware.
+
+## Quick start
+
+```bash
+uvx --from git+https://github.com/jlopez/socketry socketry login --email you@example.com --password 'yourpass'
+uvx --from git+https://github.com/jlopez/socketry socketry get
+```
+
+Or install it once and use `socketry` directly:
+
+```bash
+uv tool install git+https://github.com/jlopez/socketry
+socketry login --email you@example.com --password 'yourpass'
+socketry get
+```
 
 ## Supported devices
 
@@ -26,32 +44,30 @@ All 10 models in the current Jackery app share the same protocol:
 Properties and MQTT action IDs are exhaustive for this APK version. Unknown
 properties returned by newer firmware are displayed as raw key/value pairs.
 
-## Quick start
-
-socketry is currently a single [PEP 723](https://peps.python.org/pep-0723/)
-script — just copy and run with [uv](https://docs.astral.sh/uv/):
+## Install
 
 ```bash
-# No install needed — uv handles dependencies automatically
-./socketry login --email you@example.com --password 'yourpass'
-./socketry devices
-./socketry get
-./socketry set ac on
+# Install as a CLI tool (from GitHub)
+uv tool install git+https://github.com/jlopez/socketry
+
+# Or from PyPI (once published)
+uv tool install socketry
+
+# Or install as a library
+pip install socketry
 ```
 
-A proper package with `uv tool install` support is coming.
-
-## Usage
+## CLI usage
 
 ### Login
 
 ```bash
 # Authenticates and discovers all devices (owned + shared with you)
-./socketry login --email you@example.com --password 'yourpass'
+socketry login --email you@example.com --password 'yourpass'
 
 # List devices and select the active one
-./socketry devices
-./socketry select 0
+socketry devices
+socketry select 0
 ```
 
 Credentials are saved to `~/.config/socketry/credentials.json` (mode 0600).
@@ -60,17 +76,17 @@ Credentials are saved to `~/.config/socketry/credentials.json` (mode 0600).
 
 ```bash
 # All properties (colored + grouped on a TTY)
-./socketry get
+socketry get
 
 # Single property — by CLI name or raw protocol key
-./socketry get battery          # Battery: 85%
-./socketry get rb               # Battery: 85% (same thing)
-./socketry get ac               # AC output: ON
+socketry get battery          # Battery: 85%
+socketry get rb               # Battery: 85% (same thing)
+socketry get ac               # AC output: ON
 
 # JSON output (indented on TTY, compact when piped)
-./socketry get --json
-./socketry get ac --json        # {"oac": 1}
-./socketry get --json | jq .rb  # pipe-friendly
+socketry get --json
+socketry get ac --json        # {"oac": 1}
+socketry get --json | jq .rb  # pipe-friendly
 ```
 
 Available properties:
@@ -89,31 +105,31 @@ Raw protocol keys (`rb`, `oac`, `bt`, ...) are also accepted.
 
 ```bash
 # I/O toggles
-./socketry set ac on
-./socketry set dc off
-./socketry set usb on
-./socketry set car off
+socketry set ac on
+socketry set dc off
+socketry set usb on
+socketry set car off
 
 # Light
-./socketry set light high       # off | low | high | sos
+socketry set light high       # off | low | high | sos
 
 # Device settings
-./socketry set charge-speed mute      # fast | mute
-./socketry set battery-protection eco # full | eco
-./socketry set ups on
-./socketry set sfc on
+socketry set charge-speed mute      # fast | mute
+socketry set battery-protection eco # full | eco
+socketry set ups on
+socketry set sfc on
 
 # Integer settings
-./socketry set screen-timeout 30
-./socketry set auto-shutdown 60
-./socketry set energy-saving 30
+socketry set screen-timeout 30
+socketry set auto-shutdown 60
+socketry set energy-saving 30
 
 # Wait for device confirmation
-./socketry set ac on --wait
+socketry set ac on --wait
 
 # Show available settings
-./socketry set
-./socketry set light            # "expects a value: off | low | high | sos"
+socketry set
+socketry set light            # "expects a value: off | low | high | sos"
 ```
 
 Writable settings:
@@ -135,6 +151,32 @@ Writable settings:
 | `sfc` | on / off | Super fast charge |
 | `ups` | on / off | UPS mode |
 
+## Library usage
+
+```python
+from socketry import Client
+
+# Authenticate (or load saved credentials)
+client = Client.login("email@example.com", "password")
+client.save_credentials()
+
+# Or load previously saved credentials
+client = Client.from_saved()
+
+# List and select devices
+devices = client.fetch_devices()
+client.select_device(0)
+
+# Read properties
+props = client.get_all_properties()
+setting, value = client.get_property("battery")
+print(f"{setting.name}: {setting.format_value(value)}")
+
+# Control
+client.set_property("ac", "on")
+result = client.set_property("light", "high", wait=True)
+```
+
 ## How it works
 
 ```
@@ -149,12 +191,8 @@ protocol specification.
 
 ## Roadmap
 
-- [ ] Package structure with `uv tool install` support
-- [ ] Python API (programmatic access, not just CLI)
-- [ ] Home Assistant integration
 - [ ] MQTT real-time monitor (subscribe to live property changes)
 - [ ] Token auto-refresh (JWT expires ~30 days)
-- [ ] BLE control path (local-only, no internet required)
 
 ## License
 
