@@ -11,7 +11,7 @@ license = "MIT"
 dependencies = [
     "typer>=0.9",
     "paho-mqtt>=2.0",
-    "requests>=2.31",
+    "aiohttp>=3.9",
     "pycryptodome>=3.19",
 ]
 
@@ -24,12 +24,13 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+    "aioresponses>=0.7",
     "mypy>=1.19.1",
     "pre-commit>=4.5.1",
     "pytest>=9.0.2",
+    "pytest-asyncio>=0.26",
     "pytest-cov>=6.0.0",
     "ruff>=0.14.14",
-    "types-requests>=2.31.0",
 ]
 
 [tool.ruff]
@@ -98,6 +99,7 @@ addopts = [
     "--cov-report=html",
     "--cov-report=json",
 ]
+asyncio_mode = "auto"
 
 [tool.coverage.run]
 source = ["src/socketry"]

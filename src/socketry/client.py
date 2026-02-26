@@ -3,10 +3,11 @@
 Provides programmatic access to Jackery power stations via their cloud
 HTTP API and MQTT broker. The :class:`Client` class is the main entry point::
 
+    import asyncio
     from socketry import Client
 
-    client = Client.login("email@example.com", "password")
-    props = client.get_all_properties()
+    client = await Client.login("email@example.com", "password")
+    props = await client.get_all_properties()
     client.set_property("ac", "on", wait=True)
 """
 
@@ -20,8 +21,8 @@ import ssl
 import tempfile
 import time
 
+import aiohttp
 import paho.mqtt.client as mqtt
-import requests
 
 from socketry._constants import (
     API_BASE,
@@ -57,13 +58,13 @@ class Client:
     # ------------------------------------------------------------------
 
     @classmethod
-    def login(cls, email: str, password: str) -> Client:
+    async def login(cls, email: str, password: str) -> Client:
         """Authenticate with Jackery and return a new client.
 
         Credentials are **not** saved automatically — call
         :meth:`save_credentials` to persist them.
         """
-        creds = _http_login(email, password)
+        creds = await _http_login(email, password)
         return cls(creds)
 
     @classmethod
@@ -121,12 +122,13 @@ class Client:
     # Device management
     # ------------------------------------------------------------------
 
-    def fetch_devices(self) -> list[dict[str, object]]:
+    async def fetch_devices(self) -> list[dict[str, object]]:
         """Refresh the device list from the API.
 
         Updates the internal cache and returns all devices.
         """
-        all_devices = _fetch_all_devices(self.token)
+        async with aiohttp.ClientSession() as session:
+            all_devices = await _fetch_all_devices(self.token, session)
         self._creds["devices"] = all_devices
         return all_devices
 
@@ -150,7 +152,7 @@ class Client:
     # Status (HTTP)
     # ------------------------------------------------------------------
 
-    def get_all_properties(self) -> dict[str, object]:
+    async def get_all_properties(self) -> dict[str, object]:
         """Fetch the full property map for the active device.
 
         Returns the raw ``data`` dict from the HTTP API, containing
@@ -158,9 +160,10 @@ class Client:
         """
         if not self.device_id:
             raise ValueError("No deviceId. Call login() or select_device() first.")
-        return _fetch_device_properties(self.token, self.device_id)
+        async with aiohttp.ClientSession() as session:
+            return await _fetch_device_properties(self.token, self.device_id, session)
 
-    def get_property(self, name: str) -> tuple[Setting, object]:
+    async def get_property(self, name: str) -> tuple[Setting, object]:
         """Fetch a single property by slug or raw key.
 
         Returns ``(setting, raw_value)``.
@@ -171,7 +174,7 @@ class Client:
         setting = resolve(name)
         if setting is None:
             raise KeyError(f"Unknown property '{name}'.")
-        data = self.get_all_properties()
+        data = await self.get_all_properties()
         props = data.get("properties") or data
         if not isinstance(props, dict) or setting.id not in props:
             raise KeyError(f"Property '{name}' ({setting.id}) not reported by device.")
@@ -251,7 +254,7 @@ def _resolve_value(setting: Setting, value: str | int) -> int:
         ) from None
 
 
-def _http_login(email: str, password: str) -> dict[str, object]:
+async def _http_login(email: str, password: str) -> dict[str, object]:
     """Perform the encrypted HTTP login and return credentials."""
     mac_id = get_mac_id()
     login_bean = json.dumps(
@@ -277,22 +280,24 @@ def _http_login(email: str, password: str) -> dict[str, object]:
     encrypted_key = rsa_encrypt(aes_key_bytes, RSA_PUBLIC_KEY_B64)
     rsa_for_aes_key = base64.b64encode(encrypted_key).decode("ascii")
 
-    resp = requests.post(
-        f"{API_BASE}/auth/login",
-        params={"aesEncryptData": aes_encrypt_data, "rsaForAesKey": rsa_for_aes_key},
-        headers=APP_HEADERS,
-        timeout=15,
-    )
-    resp.raise_for_status()
-    body = resp.json()
-    if body.get("code") != 0:
-        msg = body.get("msg", "unknown error")
-        raise RuntimeError(f"Login failed: {msg}")
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            f"{API_BASE}/auth/login",
+            params={"aesEncryptData": aes_encrypt_data, "rsaForAesKey": rsa_for_aes_key},
+            headers=APP_HEADERS,
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            resp.raise_for_status()
+            body = await resp.json()
 
-    data = body["data"]
-    token = body["token"]
+        if body.get("code") != 0:
+            msg = body.get("msg", "unknown error")
+            raise RuntimeError(f"Login failed: {msg}")
 
-    all_devices = _fetch_all_devices(token)
+        data = body["data"]
+        token = body["token"]
+
+        all_devices = await _fetch_all_devices(token, session)
 
     creds: dict[str, object] = {
         "userId": data["userId"],
@@ -315,15 +320,19 @@ def _http_login(email: str, password: str) -> dict[str, object]:
     return creds
 
 
-def _fetch_all_devices(token: str) -> list[dict[str, object]]:
+async def _fetch_all_devices(token: str, session: aiohttp.ClientSession) -> list[dict[str, object]]:
     """Fetch all devices (owned + shared) using the given auth token."""
     auth_headers = {**APP_HEADERS, "token": token}
     all_devices: list[dict[str, object]] = []
+    timeout = aiohttp.ClientTimeout(total=15)
 
     # Owned devices
-    dev_resp = requests.get(f"{API_BASE}/device/bind/list", headers=auth_headers, timeout=15)
-    dev_resp.raise_for_status()
-    for d in dev_resp.json().get("data") or []:
+    async with session.get(
+        f"{API_BASE}/device/bind/list", headers=auth_headers, timeout=timeout
+    ) as dev_resp:
+        dev_resp.raise_for_status()
+        dev_body = await dev_resp.json()
+    for d in dev_body.get("data") or []:
         all_devices.append(
             {
                 "devSn": d["devSn"],
@@ -335,23 +344,27 @@ def _fetch_all_devices(token: str) -> list[dict[str, object]]:
         )
 
     # Shared devices
-    shared_resp = requests.get(f"{API_BASE}/device/bind/shared", headers=auth_headers, timeout=15)
-    shared_resp.raise_for_status()
-    shared_data = shared_resp.json().get("data") or {}
+    async with session.get(
+        f"{API_BASE}/device/bind/shared", headers=auth_headers, timeout=timeout
+    ) as shared_resp:
+        shared_resp.raise_for_status()
+        shared_body = await shared_resp.json()
+    shared_data = shared_body.get("data") or {}
     seen_sns: set[object] = {d["devSn"] for d in all_devices}
 
     for share in shared_data.get("receive", []):
-        mgr_resp = requests.post(
+        async with session.post(
             f"{API_BASE}/device/bind/share/list",
             data={
                 "bindUserId": str(share["bindUserId"]),
                 "level": str(share["level"]),
             },
             headers=auth_headers,
-            timeout=15,
-        )
-        mgr_resp.raise_for_status()
-        for d in mgr_resp.json().get("data") or []:
+            timeout=timeout,
+        ) as mgr_resp:
+            mgr_resp.raise_for_status()
+            mgr_body = await mgr_resp.json()
+        for d in mgr_body.get("data") or []:
             sn = d["devSn"]
             if sn not in seen_sns:
                 seen_sns.add(sn)
@@ -369,17 +382,19 @@ def _fetch_all_devices(token: str) -> list[dict[str, object]]:
     return all_devices
 
 
-def _fetch_device_properties(token: str, device_id: str) -> dict[str, object]:
+async def _fetch_device_properties(
+    token: str, device_id: str, session: aiohttp.ClientSession
+) -> dict[str, object]:
     """Fetch full property map for a device via HTTP API."""
     auth_headers = {**APP_HEADERS, "token": token}
-    resp = requests.get(
+    async with session.get(
         f"{API_BASE}/device/property",
         params={"deviceId": device_id},
         headers=auth_headers,
-        timeout=15,
-    )
-    resp.raise_for_status()
-    body = resp.json()
+        timeout=aiohttp.ClientTimeout(total=15),
+    ) as resp:
+        resp.raise_for_status()
+        body = await resp.json()
     if body.get("code") != 0:
         msg = body.get("msg", "unknown error")
         raise RuntimeError(f"Property fetch failed: {msg}")
