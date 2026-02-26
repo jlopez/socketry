@@ -326,7 +326,7 @@ def set_setting(
     typer.echo(f"Setting {s.slug} to {value}...")
 
     try:
-        result = client.set_property(setting, value, wait=wait, verbose=verbose)
+        result = asyncio.run(client.set_property(setting, value, wait=wait, verbose=verbose))
     except (KeyError, ValueError) as e:
         typer.echo(str(e), err=True)
         raise typer.Exit(1) from None
