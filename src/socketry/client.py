@@ -293,21 +293,26 @@ def _http_login(email: str, password: str) -> dict[str, object]:
     token = body["token"]
 
     all_devices = _fetch_all_devices(token)
-    if not all_devices:
-        raise RuntimeError("No owned or shared devices found.")
 
-    device = all_devices[0]
-    return {
+    creds: dict[str, object] = {
         "userId": data["userId"],
         "mqttPassWord": data["mqttPassWord"],
         "token": token,
-        "deviceSn": device["devSn"],
-        "deviceId": device["devId"],
-        "deviceName": device["devName"],
+        "deviceSn": "",
+        "deviceId": "",
+        "deviceName": "",
         "email": email,
         "macId": mac_id,
         "devices": all_devices,
     }
+
+    if all_devices:
+        device = all_devices[0]
+        creds["deviceSn"] = device["devSn"]
+        creds["deviceId"] = device["devId"]
+        creds["deviceName"] = device["devName"]
+
+    return creds
 
 
 def _fetch_all_devices(token: str) -> list[dict[str, object]]:
@@ -333,6 +338,8 @@ def _fetch_all_devices(token: str) -> list[dict[str, object]]:
     shared_resp = requests.get(f"{API_BASE}/device/bind/shared", headers=auth_headers, timeout=15)
     shared_resp.raise_for_status()
     shared_data = shared_resp.json().get("data") or {}
+    seen_sns: set[object] = {d["devSn"] for d in all_devices}
+
     for share in shared_data.get("receive", []):
         mgr_resp = requests.post(
             f"{API_BASE}/device/bind/share/list",
@@ -344,17 +351,20 @@ def _fetch_all_devices(token: str) -> list[dict[str, object]]:
             timeout=15,
         )
         mgr_resp.raise_for_status()
-        for d in mgr_resp.json().get("data", []):
-            all_devices.append(
-                {
-                    "devSn": d["devSn"],
-                    "devName": d.get("devNickname") or d.get("devName") or d["devSn"],
-                    "devId": d.get("devId", ""),
-                    "modelCode": d.get("modelCode", 0),
-                    "shared": True,
-                    "sharedBy": share.get("userName", ""),
-                }
-            )
+        for d in mgr_resp.json().get("data") or []:
+            sn = d["devSn"]
+            if sn not in seen_sns:
+                seen_sns.add(sn)
+                all_devices.append(
+                    {
+                        "devSn": sn,
+                        "devName": d.get("devNickname") or d.get("devName") or sn,
+                        "devId": d.get("devId", ""),
+                        "modelCode": d.get("modelCode", 0),
+                        "shared": True,
+                        "sharedBy": share.get("userName", ""),
+                    }
+                )
 
     return all_devices
 

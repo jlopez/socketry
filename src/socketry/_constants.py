@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import platform
 from pathlib import Path
 
 API_BASE = "https://iot.jackeryapp.com/v1"
@@ -45,8 +46,16 @@ UJLtYvgsxiBKAnK8YkAyu51Jm8uLz1BZ1RANf22vv0QUTW+SGdgc5Q1h610G9N1i
 CRED_DIR = Path.home() / ".config" / "socketry"
 CRED_FILE = CRED_DIR / "credentials.json"
 
+# The server requires Android-style headers for some endpoints (notably
+# /device/bind/list returns error 10600 without them).  Values match the
+# decompiled APK v1.0.7 request interceptor (AppApplication.u).
 APP_HEADERS: dict[str, str] = {
     "platform": "2",
-    "app_version": "1.2.0",
+    "app_version": "v1.0.7",
+    "app_version_code": "107",
+    "Accept-Language": "en",
+    "sys_version": f"Python {platform.python_version()}",
+    "device_model": f"{platform.system()}/{platform.machine()}",
+    "network": "wifi",
     "Content-Type": "application/x-www-form-urlencoded",
 }

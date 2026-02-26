@@ -22,11 +22,29 @@ For status over the network, use `GET /device/property?deviceId={devId}` instead
 ## HTTP API
 
 **Base**: `https://iot.jackeryapp.com/v1`
-**Common headers**: `platform: 2`, `app_version: 1.2.0`, `token: {jwt}` (post-login)
+
+**Common headers** (from `AppApplication.u`):
+| Header | Value |
+|--------|-------|
+| `platform` | `2` |
+| `app_version` | `v1.0.7` (prefixed with `v`; from APK build config) |
+| `app_version_code` | `107` |
+| `Accept-Language` | `en` (or device locale) |
+| `sys_version` | e.g. `Android 14,level 34/[arm64-v8a]` |
+| `device_model` | e.g. `samsung/SM-G991B` |
+| `network` | `mobile` or `wifi` |
+| `token` | `{jwt}` (post-login) |
+
+**Important**: The server requires the full set of headers above for some endpoints.
+Notably, `GET /device/bind/list` returns error code 10600 if headers like `app_version_code`,
+`Accept-Language`, `sys_version`, `device_model`, or `network` are missing. Other endpoints
+(e.g. `/device/bind/shared`, `/device/property`) work with just `platform`, `app_version`,
+and `token`.
 
 **Note**: The app's HTTP client (`mh.k`) uses POST for all API calls. Fields on the API
 object are serialized as form-encoded body params. Endpoints with no request fields (like
-`device/bind/list` and `device/bind/shared`) also accept GET.
+`device/bind/list` and `device/bind/shared`) accept GET but **not** POST — POST returns
+error 10600 for parameterless endpoints.
 
 ### Login: `POST /auth/login`
 

@@ -63,9 +63,16 @@ def login(
     client = Client.login(email, password)
     client.save_credentials()
     n = len(client.devices)
-    typer.echo(
-        f"Logged in. {n} device(s) found. Selected: {client.device_name} (SN: {client.device_sn})"
-    )
+    if n == 0:
+        typer.echo(
+            "Logged in, but no devices found. Run `socketry debug` to troubleshoot.",
+            err=True,
+        )
+    else:
+        typer.echo(
+            f"Logged in. {n} device(s) found."
+            f" Selected: {client.device_name} (SN: {client.device_sn})"
+        )
 
 
 @app.command()
@@ -103,6 +110,61 @@ def select(index: int) -> None:
     client.save_credentials()
     model = MODEL_NAMES.get(int(str(dev.get("modelCode", 0) or 0)), "Unknown model")
     typer.echo(f"Selected: {dev['devName']} — {model} (SN: {dev['devSn']})")
+
+
+@app.command()
+def debug() -> None:
+    """Dump raw API responses for troubleshooting device access."""
+    import requests as req
+
+    from socketry._constants import API_BASE, APP_HEADERS
+
+    client = _ensure_client()
+    auth_headers = {**APP_HEADERS, "token": client.token}
+
+    typer.echo("=== GET /device/bind/list (owned devices) ===")
+    try:
+        resp = req.get(
+            f"{API_BASE}/device/bind/list",
+            headers=auth_headers,
+            timeout=15,
+        )
+        typer.echo(f"Status: {resp.status_code}")
+        _print_json(resp.json())
+    except Exception as e:
+        typer.echo(f"Error: {e}")
+
+    typer.echo("\n=== GET /device/bind/shared (share relationships) ===")
+    try:
+        resp = req.get(
+            f"{API_BASE}/device/bind/shared",
+            headers=auth_headers,
+            timeout=15,
+        )
+        typer.echo(f"Status: {resp.status_code}")
+        _print_json(resp.json())
+    except Exception as e:
+        typer.echo(f"Error: {e}")
+
+    devs = client.devices
+    if devs:
+        dev = devs[0]
+        dev_id = dev.get("devId", "")
+        if dev_id:
+            typer.echo(f"\n=== GET /device/property?deviceId={dev_id} (first device) ===")
+            try:
+                resp = req.get(
+                    f"{API_BASE}/device/property",
+                    params={"deviceId": str(dev_id)},
+                    headers=auth_headers,
+                    timeout=15,
+                )
+                typer.echo(f"Status: {resp.status_code}")
+                _print_json(resp.json())
+            except Exception as e:
+                typer.echo(f"Error: {e}")
+        else:
+            typer.echo(f"\n(!) First device has empty devId: {json.dumps(dev)}")
 
 
 @app.command("get", context_settings={"help_option_names": ["-h", "--help"]})
