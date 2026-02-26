@@ -1,6 +1,6 @@
 [project]
 name = "socketry"
-version = "0.1.0"
+version = "0.1.1"
 description = "Python API and CLI for controlling Jackery portable power stations"
 readme = "README.md"
 authors = [
