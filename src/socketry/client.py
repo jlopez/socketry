@@ -15,10 +15,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
 import secrets
 import ssl
 import time
+from collections.abc import Awaitable, Callable
 
 import aiohttp
 import aiomqtt
@@ -180,6 +182,34 @@ class Client:
         return setting, props[setting.id]
 
     # ------------------------------------------------------------------
+    # Subscription (MQTT)
+    # ------------------------------------------------------------------
+
+    async def subscribe(
+        self,
+        callback: Callable[[str, dict[str, object]], Awaitable[None]],
+        *,
+        on_disconnect: Callable[[], Awaitable[None]] | None = None,
+    ) -> Subscription:
+        """Subscribe to real-time property updates from all devices.
+
+        The *callback* is invoked with ``(device_sn, properties)`` for
+        every ``DevicePropertyChange`` message received on the device
+        topic.  Messages are **not** filtered by device — the consumer
+        receives updates for all devices on the account.
+
+        If *on_disconnect* is provided it is called whenever the broker
+        disconnects and the loop is about to reconnect.
+
+        Returns a :class:`Subscription` whose :meth:`~Subscription.stop`
+        method cancels the background listener.
+        """
+        task = asyncio.create_task(
+            _subscribe_loop(self._creds, callback, on_disconnect=on_disconnect)
+        )
+        return Subscription(task)
+
+    # ------------------------------------------------------------------
     # Control (MQTT)
     # ------------------------------------------------------------------
 
@@ -227,6 +257,32 @@ class Client:
         else:
             await _publish_command(self._creds, setting.action_id, body)
             return None
+
+
+class Subscription:
+    """Handle for a persistent MQTT subscription.
+
+    Returned by :meth:`Client.subscribe`.  Call :meth:`stop` to cancel
+    the background listener, or :meth:`wait` to block until the
+    subscription ends (e.g. via cancellation or error).
+    """
+
+    def __init__(self, task: asyncio.Task[None]) -> None:
+        self._task = task
+
+    async def stop(self) -> None:
+        """Cancel the subscription and wait for cleanup."""
+        self._task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await self._task
+
+    async def wait(self) -> None:
+        """Wait until the subscription ends.
+
+        Raises :class:`asyncio.CancelledError` if the task is cancelled
+        externally (e.g. by *Ctrl-C*).
+        """
+        await self._task
 
 
 # ---------------------------------------------------------------------------
@@ -462,6 +518,76 @@ async def _publish_command(
         await client.publish(topic, payload, qos=1)
 
 
+def _parse_device_update(
+    payload: bytes | bytearray,
+) -> tuple[str, dict[str, object]] | None:
+    """Parse an MQTT message into ``(device_sn, properties)`` or ``None``.
+
+    Returns ``None`` for non-JSON payloads, non-``DevicePropertyChange``
+    messages, non-dict bodies, and broker ACKs (body with only
+    ``messageId``).  The ``messageId`` key is always stripped from the
+    returned properties since it is protocol metadata, not a device
+    property.
+    """
+    try:
+        data: dict[str, object] = json.loads(payload)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    device_sn = data.get("deviceSn")
+    if not isinstance(device_sn, str):
+        return None
+    if data.get("messageType") != "DevicePropertyChange":
+        return None
+    body = data.get("body")
+    if not isinstance(body, dict):
+        return None
+    # Strip protocol-level messageId — it's not a device property
+    props = {k: v for k, v in body.items() if k != "messageId"}
+    if not props:
+        return None
+    return device_sn, props
+
+
+_RECONNECT_INTERVAL = 5  # seconds between reconnection attempts
+
+
+async def _subscribe_loop(
+    creds: dict[str, object],
+    callback: Callable[[str, dict[str, object]], Awaitable[None]],
+    *,
+    on_disconnect: Callable[[], Awaitable[None]] | None = None,
+) -> None:
+    """Persistent MQTT listener that invokes *callback* for every update.
+
+    Uses the standard client ID (``{userId}@APP``) because the Jackery
+    broker enforces ACLs tied to this identifier.  When a one-shot
+    command (``set_property``) connects with the same ID the broker
+    disconnects this subscription, but the reconnection loop recovers
+    automatically.
+    """
+    user_id = creds["userId"]
+    dev_topic = f"hb/app/{user_id}/device"
+    params = _mqtt_params(creds)
+
+    while True:
+        try:
+            async with aiomqtt.Client(**params) as client:  # type: ignore[arg-type]
+                await client.subscribe(dev_topic, qos=1)
+                async for message in client.messages:
+                    parsed = _parse_device_update(message.payload)
+                    if parsed is not None:
+                        device_sn, properties = parsed
+                        await callback(device_sn, properties)
+        except aiomqtt.MqttError:
+            pass
+        # Notify and retry whether the disconnect was an error or a clean
+        # broker close (e.g. another client took the same MQTT client ID).
+        # CancelledError is NOT caught above, so stop() still works.
+        if on_disconnect is not None:
+            await on_disconnect()
+        await asyncio.sleep(_RECONNECT_INTERVAL)
+
+
 async def _publish_and_wait(
     creds: dict[str, object],
     action_id: int,
@@ -482,18 +608,19 @@ async def _publish_and_wait(
         try:
             async with asyncio.timeout(timeout):
                 async for message in client.messages:
-                    try:
-                        data: dict[str, object] = json.loads(message.payload)
-                    except (json.JSONDecodeError, TypeError):
+                    parsed = _parse_device_update(message.payload)
+                    if parsed is None:
                         continue
-                    if data.get("deviceSn") != device_sn:
+                    msg_sn, props = parsed
+                    if msg_sn != device_sn:
                         continue
-                    msg_type = data.get("messageType", "")
-                    resp_body = data.get("body")
-                    if msg_type == "DevicePropertyChange" and isinstance(resp_body, dict):
-                        if list(resp_body.keys()) == ["messageId"]:
-                            continue
-                        return data
+                    # _parse_device_update already filtered broker ACKs
+                    # Reconstruct the full message dict for the caller
+                    return {
+                        "deviceSn": msg_sn,
+                        "messageType": "DevicePropertyChange",
+                        "body": props,
+                    }
         except TimeoutError:
             pass
 
