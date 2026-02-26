@@ -1,7 +1,7 @@
 # socketry
 
 [![CI](https://github.com/jlopez/socketry/actions/workflows/ci.yml/badge.svg)](https://github.com/jlopez/socketry/actions/workflows/ci.yml)
-![Coverage](https://img.shields.io/badge/coverage-22%25-red)
+![Coverage](https://img.shields.io/badge/coverage-44%25-orange)
 ![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue)
 
 Python API and CLI for controlling Jackery portable power stations.
@@ -155,27 +155,31 @@ Writable settings:
 ## Library usage
 
 ```python
+import asyncio
 from socketry import Client
 
-# Authenticate (or load saved credentials)
-client = Client.login("email@example.com", "password")
-client.save_credentials()
+async def main():
+    # Authenticate (or load saved credentials)
+    client = await Client.login("email@example.com", "password")
+    client.save_credentials()
 
-# Or load previously saved credentials
-client = Client.from_saved()
+    # Or load previously saved credentials
+    client = Client.from_saved()
 
-# List and select devices
-devices = client.fetch_devices()
-client.select_device(0)
+    # List and select devices
+    devices = await client.fetch_devices()
+    client.select_device(0)
 
-# Read properties
-props = client.get_all_properties()
-setting, value = client.get_property("battery")
-print(f"{setting.name}: {setting.format_value(value)}")
+    # Read properties
+    props = await client.get_all_properties()
+    setting, value = await client.get_property("battery")
+    print(f"{setting.name}: {setting.format_value(value)}")
 
-# Control
-client.set_property("ac", "on")
-result = client.set_property("light", "high", wait=True)
+    # Control
+    client.set_property("ac", "on")
+    result = client.set_property("light", "high", wait=True)
+
+asyncio.run(main())
 ```
 
 ## How it works

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 
@@ -60,7 +61,7 @@ def login(
 ) -> None:
     """Authenticate with Jackery and save credentials locally."""
     typer.echo(f"Logging in as {email}...")
-    client = Client.login(email, password)
+    client = asyncio.run(Client.login(email, password))
     client.save_credentials()
     n = len(client.devices)
     if n == 0:
@@ -80,7 +81,7 @@ def devices() -> None:
     """List all devices (owned and shared). Refreshes from API."""
     client = _ensure_client()
     typer.echo("Fetching devices...")
-    all_devices = client.fetch_devices()
+    all_devices = asyncio.run(client.fetch_devices())
     if not all_devices:
         typer.echo("No devices found.", err=True)
         raise typer.Exit(1)
@@ -115,56 +116,63 @@ def select(index: int) -> None:
 @app.command()
 def debug() -> None:
     """Dump raw API responses for troubleshooting device access."""
-    import requests as req
+    asyncio.run(_debug_async())
+
+
+async def _debug_async() -> None:
+    """Async implementation of the debug command."""
+    import aiohttp
 
     from socketry._constants import API_BASE, APP_HEADERS
 
     client = _ensure_client()
     auth_headers = {**APP_HEADERS, "token": client.token}
+    timeout = aiohttp.ClientTimeout(total=15)
 
-    typer.echo("=== GET /device/bind/list (owned devices) ===")
-    try:
-        resp = req.get(
-            f"{API_BASE}/device/bind/list",
-            headers=auth_headers,
-            timeout=15,
-        )
-        typer.echo(f"Status: {resp.status_code}")
-        _print_json(resp.json())
-    except Exception as e:
-        typer.echo(f"Error: {e}")
+    async with aiohttp.ClientSession() as session:
+        typer.echo("=== GET /device/bind/list (owned devices) ===")
+        try:
+            async with session.get(
+                f"{API_BASE}/device/bind/list",
+                headers=auth_headers,
+                timeout=timeout,
+            ) as resp:
+                typer.echo(f"Status: {resp.status}")
+                _print_json(await resp.json())
+        except Exception as e:
+            typer.echo(f"Error: {e}")
 
-    typer.echo("\n=== GET /device/bind/shared (share relationships) ===")
-    try:
-        resp = req.get(
-            f"{API_BASE}/device/bind/shared",
-            headers=auth_headers,
-            timeout=15,
-        )
-        typer.echo(f"Status: {resp.status_code}")
-        _print_json(resp.json())
-    except Exception as e:
-        typer.echo(f"Error: {e}")
+        typer.echo("\n=== GET /device/bind/shared (share relationships) ===")
+        try:
+            async with session.get(
+                f"{API_BASE}/device/bind/shared",
+                headers=auth_headers,
+                timeout=timeout,
+            ) as resp:
+                typer.echo(f"Status: {resp.status}")
+                _print_json(await resp.json())
+        except Exception as e:
+            typer.echo(f"Error: {e}")
 
-    devs = client.devices
-    if devs:
-        dev = devs[0]
-        dev_id = dev.get("devId", "")
-        if dev_id:
-            typer.echo(f"\n=== GET /device/property?deviceId={dev_id} (first device) ===")
-            try:
-                resp = req.get(
-                    f"{API_BASE}/device/property",
-                    params={"deviceId": str(dev_id)},
-                    headers=auth_headers,
-                    timeout=15,
-                )
-                typer.echo(f"Status: {resp.status_code}")
-                _print_json(resp.json())
-            except Exception as e:
-                typer.echo(f"Error: {e}")
-        else:
-            typer.echo(f"\n(!) First device has empty devId: {json.dumps(dev)}")
+        devs = client.devices
+        if devs:
+            dev = devs[0]
+            dev_id = dev.get("devId", "")
+            if dev_id:
+                typer.echo(f"\n=== GET /device/property?deviceId={dev_id} (first device) ===")
+                try:
+                    async with session.get(
+                        f"{API_BASE}/device/property",
+                        params={"deviceId": str(dev_id)},
+                        headers=auth_headers,
+                        timeout=timeout,
+                    ) as resp:
+                        typer.echo(f"Status: {resp.status}")
+                        _print_json(await resp.json())
+                except Exception as e:
+                    typer.echo(f"Error: {e}")
+            else:
+                typer.echo(f"\n(!) First device has empty devId: {json.dumps(dev)}")
 
 
 @app.command("get", context_settings={"help_option_names": ["-h", "--help"]})
@@ -183,7 +191,7 @@ def get_property(
     client = _ensure_client()
 
     try:
-        data = client.get_all_properties()
+        data = asyncio.run(client.get_all_properties())
     except (ValueError, RuntimeError) as e:
         typer.echo(str(e), err=True)
         raise typer.Exit(1) from None
