@@ -1,7 +1,7 @@
 # socketry
 
 [![CI](https://github.com/jlopez/socketry/actions/workflows/ci.yml/badge.svg)](https://github.com/jlopez/socketry/actions/workflows/ci.yml)
-![Coverage](https://img.shields.io/badge/coverage-44%25-orange)
+![Coverage](https://img.shields.io/badge/coverage-59%25-orange)
 ![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue)
 
 Python API and CLI for controlling Jackery portable power stations.
@@ -176,8 +176,8 @@ async def main():
     print(f"{setting.name}: {setting.format_value(value)}")
 
     # Control
-    client.set_property("ac", "on")
-    result = client.set_property("light", "high", wait=True)
+    await client.set_property("ac", "on")
+    result = await client.set_property("light", "high", wait=True)
 
 asyncio.run(main())
 ```

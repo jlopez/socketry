@@ -4,19 +4,25 @@ from __future__ import annotations
 
 import json
 import re
+import ssl
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiohttp
 import pytest
 from aioresponses import aioresponses
 
-from socketry._constants import API_BASE
+from socketry._constants import API_BASE, MQTT_HOST, MQTT_PORT
 from socketry.client import (
     Client,
     _build_command_payload,
     _fetch_all_devices,
     _fetch_device_properties,
     _http_login,
+    _make_tls_context,
+    _mqtt_params,
+    _publish_and_wait,
+    _publish_command,
     _resolve_value,
 )
 from socketry.properties import Setting
@@ -414,3 +420,324 @@ class TestClientSaveCredentials:
         data = json.loads(cred_file.read_text())
         assert data["token"] == "t"
         assert (cred_file.stat().st_mode & 0o777) == 0o600
+
+
+# ---------------------------------------------------------------------------
+# MQTT tests
+# ---------------------------------------------------------------------------
+
+MOCK_CREDS: dict[str, object] = {
+    "userId": "U001",
+    "macId": "aa:bb:cc:dd:ee:ff",
+    "mqttPassWord": "bXF0dHB3ZGVyaXZlZGtleQ==",
+    "deviceSn": "SN001",
+    "deviceId": "DEV001",
+    "token": "tok",
+}
+
+
+class TestMakeTlsContext:
+    def test_returns_ssl_context(self):
+        ctx = _make_tls_context()
+        assert isinstance(ctx, ssl.SSLContext)
+
+    def test_ca_cert_loaded(self):
+        ctx = _make_tls_context()
+        # The context should have at least one CA cert loaded
+        stats = ctx.cert_store_stats()
+        assert stats["x509_ca"] >= 1
+
+
+class TestMqttParams:
+    def test_hostname_and_port(self):
+        params = _mqtt_params(MOCK_CREDS)
+        assert params["hostname"] == MQTT_HOST
+        assert params["port"] == MQTT_PORT
+
+    def test_identifier(self):
+        params = _mqtt_params(MOCK_CREDS)
+        assert params["identifier"] == "U001@APP"
+
+    def test_username(self):
+        params = _mqtt_params(MOCK_CREDS)
+        assert params["username"] == "U001@aa:bb:cc:dd:ee:ff"
+
+    def test_password_is_derived(self):
+        params = _mqtt_params(MOCK_CREDS)
+        # Password should be a non-empty base64 string (derived from username + mqttPassWord)
+        pw = params["password"]
+        assert isinstance(pw, str) and len(pw) > 0
+
+    def test_tls_context_present(self):
+        params = _mqtt_params(MOCK_CREDS)
+        assert isinstance(params["tls_context"], ssl.SSLContext)
+
+    def test_keepalive(self):
+        params = _mqtt_params(MOCK_CREDS)
+        assert params["keepalive"] == 10
+
+    def test_mac_id_fallback(self):
+        creds = {**MOCK_CREDS}
+        del creds["macId"]
+        params = _mqtt_params(creds)
+        # Should still produce a valid username using get_mac_id()
+        username = params["username"]
+        assert isinstance(username, str)
+        assert username.startswith("U001@")
+
+
+def _make_mock_mqtt_client(
+    messages: list[bytes] | None = None,
+) -> tuple[AsyncMock, AsyncMock]:
+    """Create a mock aiomqtt.Client that works as an async context manager.
+
+    Args:
+        messages: List of message payloads to yield from client.messages.
+    """
+    mock_client = AsyncMock()
+    mock_client.publish = AsyncMock()
+    mock_client.subscribe = AsyncMock()
+
+    async def _message_generator() -> Any:
+        for payload in messages or []:
+            msg = MagicMock()
+            msg.payload = payload
+            yield msg
+
+    mock_client.messages = _message_generator()
+
+    mock_cm = AsyncMock()
+    mock_cm.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_cm.__aexit__ = AsyncMock(return_value=False)
+
+    return mock_cm, mock_client
+
+
+class TestPublishCommand:
+    async def test_publishes_to_correct_topic(self):
+        mock_cm, mock_client = _make_mock_mqtt_client()
+
+        with patch("socketry.client.aiomqtt.Client", return_value=mock_cm):
+            await _publish_command(MOCK_CREDS, 4, {"oac": 1})
+
+        mock_client.publish.assert_awaited_once()
+        call_args = mock_client.publish.call_args
+        assert call_args[0][0] == "hb/app/U001/command"
+        assert call_args[1]["qos"] == 1
+
+    async def test_payload_contains_device_sn(self):
+        mock_cm, mock_client = _make_mock_mqtt_client()
+
+        with patch("socketry.client.aiomqtt.Client", return_value=mock_cm):
+            await _publish_command(MOCK_CREDS, 4, {"oac": 1})
+
+        payload_str = mock_client.publish.call_args[0][1]
+        payload = json.loads(payload_str)
+        assert payload["deviceSn"] == "SN001"
+        assert payload["actionId"] == 4
+        assert payload["body"] == {"oac": 1}
+
+    async def test_mqtt_client_params(self):
+        mock_cm, _ = _make_mock_mqtt_client()
+
+        with patch("socketry.client.aiomqtt.Client", return_value=mock_cm) as mock_cls:
+            await _publish_command(MOCK_CREDS, 4, {"oac": 1})
+
+        call_kwargs = mock_cls.call_args[1]
+        assert call_kwargs["hostname"] == MQTT_HOST
+        assert call_kwargs["port"] == MQTT_PORT
+        assert call_kwargs["identifier"] == "U001@APP"
+        assert call_kwargs["username"] == "U001@aa:bb:cc:dd:ee:ff"
+        assert isinstance(call_kwargs["tls_context"], ssl.SSLContext)
+
+
+class TestPublishAndWait:
+    def _device_response(self, body: dict[str, Any], device_sn: str = "SN001") -> bytes:
+        """Build a valid DevicePropertyChange response payload."""
+        return json.dumps(
+            {
+                "deviceSn": device_sn,
+                "messageType": "DevicePropertyChange",
+                "body": body,
+            }
+        ).encode()
+
+    def _broker_ack(self, device_sn: str = "SN001") -> bytes:
+        """Build a broker ACK message (body with only messageId)."""
+        return json.dumps(
+            {
+                "deviceSn": device_sn,
+                "messageType": "DevicePropertyChange",
+                "body": {"messageId": 0},
+            }
+        ).encode()
+
+    async def test_happy_path(self):
+        response_body = {"oac": 1, "messageId": 12345}
+        messages = [self._device_response(response_body)]
+        mock_cm, mock_client = _make_mock_mqtt_client(messages)
+
+        with patch("socketry.client.aiomqtt.Client", return_value=mock_cm):
+            result = await _publish_and_wait(MOCK_CREDS, 4, {"oac": 1})
+
+        assert result is not None
+        assert result["body"] == response_body
+        assert result["deviceSn"] == "SN001"
+
+    async def test_subscribes_before_publish(self):
+        messages = [self._device_response({"oac": 1})]
+        mock_cm, mock_client = _make_mock_mqtt_client(messages)
+
+        with patch("socketry.client.aiomqtt.Client", return_value=mock_cm):
+            await _publish_and_wait(MOCK_CREDS, 4, {"oac": 1})
+
+        # subscribe should have been called
+        mock_client.subscribe.assert_awaited_once()
+        sub_args = mock_client.subscribe.call_args
+        assert sub_args[0][0] == "hb/app/U001/device"
+        assert sub_args[1]["qos"] == 1
+
+        # publish should have been called
+        mock_client.publish.assert_awaited_once()
+        pub_args = mock_client.publish.call_args
+        assert pub_args[0][0] == "hb/app/U001/command"
+
+    async def test_skips_broker_ack(self):
+        messages = [
+            self._broker_ack(),
+            self._device_response({"oac": 1, "messageId": 123}),
+        ]
+        mock_cm, _ = _make_mock_mqtt_client(messages)
+
+        with patch("socketry.client.aiomqtt.Client", return_value=mock_cm):
+            result = await _publish_and_wait(MOCK_CREDS, 4, {"oac": 1})
+
+        assert result is not None
+        assert result["body"] == {"oac": 1, "messageId": 123}
+
+    async def test_filters_by_device_sn(self):
+        messages = [
+            self._device_response({"oac": 0}, device_sn="OTHER_SN"),
+            self._device_response({"oac": 1}, device_sn="SN001"),
+        ]
+        mock_cm, _ = _make_mock_mqtt_client(messages)
+
+        with patch("socketry.client.aiomqtt.Client", return_value=mock_cm):
+            result = await _publish_and_wait(MOCK_CREDS, 4, {"oac": 1})
+
+        assert result is not None
+        assert result["deviceSn"] == "SN001"
+
+    async def test_ignores_non_json(self):
+        messages = [
+            b"not json at all",
+            self._device_response({"oac": 1}),
+        ]
+        mock_cm, _ = _make_mock_mqtt_client(messages)
+
+        with patch("socketry.client.aiomqtt.Client", return_value=mock_cm):
+            result = await _publish_and_wait(MOCK_CREDS, 4, {"oac": 1})
+
+        assert result is not None
+        assert result["body"] == {"oac": 1}
+
+    async def test_ignores_non_device_property_change(self):
+        other_msg = json.dumps(
+            {
+                "deviceSn": "SN001",
+                "messageType": "SomeOtherType",
+                "body": {"foo": "bar"},
+            }
+        ).encode()
+        messages = [
+            other_msg,
+            self._device_response({"oac": 1}),
+        ]
+        mock_cm, _ = _make_mock_mqtt_client(messages)
+
+        with patch("socketry.client.aiomqtt.Client", return_value=mock_cm):
+            result = await _publish_and_wait(MOCK_CREDS, 4, {"oac": 1})
+
+        assert result is not None
+        assert result["messageType"] == "DevicePropertyChange"
+
+    async def test_ignores_non_dict_body(self):
+        msg_with_string_body = json.dumps(
+            {
+                "deviceSn": "SN001",
+                "messageType": "DevicePropertyChange",
+                "body": "not a dict",
+            }
+        ).encode()
+        messages = [
+            msg_with_string_body,
+            self._device_response({"oac": 1}),
+        ]
+        mock_cm, _ = _make_mock_mqtt_client(messages)
+
+        with patch("socketry.client.aiomqtt.Client", return_value=mock_cm):
+            result = await _publish_and_wait(MOCK_CREDS, 4, {"oac": 1})
+
+        assert result is not None
+        assert result["body"] == {"oac": 1}
+
+    async def test_timeout_returns_none(self):
+        mock_cm, _ = _make_mock_mqtt_client([])
+
+        with patch("socketry.client.aiomqtt.Client", return_value=mock_cm):
+            result = await _publish_and_wait(MOCK_CREDS, 4, {"oac": 1}, timeout=0.1)
+
+        assert result is None
+
+
+class TestSetProperty:
+    async def test_fire_and_forget(self):
+        mock_cm, mock_client = _make_mock_mqtt_client()
+
+        with patch("socketry.client.aiomqtt.Client", return_value=mock_cm):
+            client = Client({**MOCK_CREDS})
+            result = await client.set_property("ac", "on")
+
+        assert result is None
+        mock_client.publish.assert_awaited_once()
+
+    async def test_wait_returns_body(self):
+        response_body = {"oac": 1, "messageId": 123}
+        response = json.dumps(
+            {
+                "deviceSn": "SN001",
+                "messageType": "DevicePropertyChange",
+                "body": response_body,
+            }
+        ).encode()
+        mock_cm, _ = _make_mock_mqtt_client([response])
+
+        with patch("socketry.client.aiomqtt.Client", return_value=mock_cm):
+            client = Client({**MOCK_CREDS})
+            result = await client.set_property("ac", "on", wait=True)
+
+        assert result == response_body
+
+    async def test_wait_timeout_returns_none(self):
+        mock_cm, _ = _make_mock_mqtt_client([])
+
+        with patch("socketry.client.aiomqtt.Client", return_value=mock_cm):
+            client = Client({**MOCK_CREDS})
+            result = await client.set_property("ac", "on", wait=True)
+
+        assert result is None
+
+    async def test_unknown_setting_raises(self):
+        client = Client({**MOCK_CREDS})
+        with pytest.raises(KeyError, match="Unknown setting"):
+            await client.set_property("nonexistent", "on")
+
+    async def test_readonly_setting_raises(self):
+        client = Client({**MOCK_CREDS})
+        with pytest.raises(ValueError, match="read-only"):
+            await client.set_property("battery", "50")
+
+    async def test_invalid_value_raises(self):
+        client = Client({**MOCK_CREDS})
+        with pytest.raises(ValueError, match="Invalid value"):
+            await client.set_property("ac", "maybe")

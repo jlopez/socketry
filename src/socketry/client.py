@@ -8,21 +8,20 @@ HTTP API and MQTT broker. The :class:`Client` class is the main entry point::
 
     client = await Client.login("email@example.com", "password")
     props = await client.get_all_properties()
-    client.set_property("ac", "on", wait=True)
+    await client.set_property("ac", "on", wait=True)
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
-import os
 import secrets
 import ssl
-import tempfile
 import time
 
 import aiohttp
-import paho.mqtt.client as mqtt
+import aiomqtt
 
 from socketry._constants import (
     API_BASE,
@@ -184,7 +183,7 @@ class Client:
     # Control (MQTT)
     # ------------------------------------------------------------------
 
-    def set_property(
+    async def set_property(
         self,
         name: str,
         value: str | int,
@@ -219,14 +218,14 @@ class Client:
         assert setting.action_id is not None
 
         if wait:
-            result = _publish_and_wait(self._creds, setting.action_id, body, verbose=verbose)
+            result = await _publish_and_wait(self._creds, setting.action_id, body, verbose=verbose)
             if result is not None:
                 resp = result.get("body")
                 if isinstance(resp, dict):
                     return resp
             return None
         else:
-            _publish_command(self._creds, setting.action_id, body)
+            await _publish_command(self._creds, setting.action_id, body)
             return None
 
 
@@ -406,43 +405,31 @@ async def _fetch_device_properties(
 # ---------------------------------------------------------------------------
 
 
-def _make_mqtt_client(creds: dict[str, object]) -> tuple[mqtt.Client, str]:
-    """Create a configured MQTT client. Returns (client, ca_temp_path)."""
+def _make_tls_context() -> ssl.SSLContext:
+    """Create an SSL context using the embedded Jackery CA certificate."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.load_verify_locations(cadata=CA_CERT_PEM)
+    return ctx
+
+
+def _mqtt_params(creds: dict[str, object]) -> dict[str, object]:
+    """Derive aiomqtt.Client constructor kwargs from stored credentials."""
     user_id = creds["userId"]
     mac_id = str(creds.get("macId") or get_mac_id())
     mqtt_pw_b64 = str(creds["mqttPassWord"])
 
-    client_id = f"{user_id}@APP"
     username = f"{user_id}@{mac_id}"
     password = derive_mqtt_password(username, mqtt_pw_b64)
 
-    ca_fd, ca_path = tempfile.mkstemp(suffix=".pem")
-    os.write(ca_fd, CA_CERT_PEM.encode())
-    os.close(ca_fd)
-
-    client = mqtt.Client(
-        callback_api_version=mqtt.CallbackAPIVersion.VERSION2,  # type: ignore[attr-defined]
-        client_id=client_id,
-        protocol=mqtt.MQTTv311,
-    )
-    client.username_pw_set(username, password)
-
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    ctx.load_verify_locations(ca_path)
-    client.tls_set_context(ctx)
-
-    return client, ca_path
-
-
-def _connect_and_wait(client: mqtt.Client, timeout: float = 5) -> None:
-    """Connect to the MQTT broker and block until connected."""
-    client.connect(MQTT_HOST, MQTT_PORT, keepalive=10)
-    client.loop_start()
-    deadline = time.time() + timeout
-    while not client.is_connected() and time.time() < deadline:
-        time.sleep(0.05)
-    if not client.is_connected():
-        raise ConnectionError("Failed to connect to MQTT broker.")
+    return {
+        "hostname": MQTT_HOST,
+        "port": MQTT_PORT,
+        "identifier": f"{user_id}@APP",
+        "username": username,
+        "password": password,
+        "tls_context": _make_tls_context(),
+        "keepalive": 10,
+    }
 
 
 def _build_command_payload(device_sn: str, action_id: int, body: dict[str, object] | str) -> str:
@@ -462,25 +449,20 @@ def _build_command_payload(device_sn: str, action_id: int, body: dict[str, objec
     )
 
 
-def _publish_command(creds: dict[str, object], action_id: int, body: dict[str, object]) -> None:
+async def _publish_command(
+    creds: dict[str, object], action_id: int, body: dict[str, object]
+) -> None:
     """Connect to the MQTT broker and publish a device command."""
     user_id = creds["userId"]
     device_sn = str(creds["deviceSn"])
     topic = f"hb/app/{user_id}/command"
     payload = _build_command_payload(device_sn, action_id, body)
 
-    client, ca_path = _make_mqtt_client(creds)
-    try:
-        _connect_and_wait(client)
-        info = client.publish(topic, payload, qos=1)
-        info.wait_for_publish(timeout=5)
-        client.disconnect()
-        client.loop_stop()
-    finally:
-        os.unlink(ca_path)
+    async with aiomqtt.Client(**_mqtt_params(creds)) as client:  # type: ignore[arg-type]
+        await client.publish(topic, payload, qos=1)
 
 
-def _publish_and_wait(
+async def _publish_and_wait(
     creds: dict[str, object],
     action_id: int,
     body: dict[str, object],
@@ -494,52 +476,25 @@ def _publish_and_wait(
     dev_topic = f"hb/app/{user_id}/device"
     payload = _build_command_payload(device_sn, action_id, body)
 
-    result: dict[str, object] | None = None
-    done = False
-
-    def on_connect(
-        client: mqtt.Client,
-        _ud: object,
-        _flags: object,
-        rc: int,
-        _props: object = None,
-    ) -> None:
-        if rc == 0:
-            client.subscribe(dev_topic, qos=1)
-
-    def on_message(
-        client: mqtt.Client,
-        _ud: object,
-        msg: mqtt.MQTTMessage,
-    ) -> None:
-        nonlocal result, done
+    async with aiomqtt.Client(**_mqtt_params(creds)) as client:  # type: ignore[arg-type]
+        await client.subscribe(dev_topic, qos=1)
+        await client.publish(cmd_topic, payload, qos=1)
         try:
-            data = json.loads(msg.payload)
-        except json.JSONDecodeError:
-            return
-        if data.get("deviceSn") != device_sn:
-            return
-        msg_type = data.get("messageType", "")
-        if msg_type == "DevicePropertyChange" and isinstance(data.get("body"), dict):
-            resp_body = data["body"]
-            if list(resp_body.keys()) == ["messageId"]:
-                return
-            result = data
-            done = True
+            async with asyncio.timeout(timeout):
+                async for message in client.messages:
+                    try:
+                        data: dict[str, object] = json.loads(message.payload)
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                    if data.get("deviceSn") != device_sn:
+                        continue
+                    msg_type = data.get("messageType", "")
+                    resp_body = data.get("body")
+                    if msg_type == "DevicePropertyChange" and isinstance(resp_body, dict):
+                        if list(resp_body.keys()) == ["messageId"]:
+                            continue
+                        return data
+        except TimeoutError:
+            pass
 
-    client, ca_path = _make_mqtt_client(creds)
-    client.on_connect = on_connect
-    client.on_message = on_message
-    try:
-        _connect_and_wait(client)
-        time.sleep(0.2)
-        client.publish(cmd_topic, payload, qos=1)
-        deadline = time.time() + timeout
-        while not done and time.time() < deadline:
-            time.sleep(0.1)
-        client.disconnect()
-        client.loop_stop()
-    finally:
-        os.unlink(ca_path)
-
-    return result
+    return None
