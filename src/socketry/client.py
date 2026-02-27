@@ -1,14 +1,23 @@
 """Jackery power station API client.
 
 Provides programmatic access to Jackery power stations via their cloud
-HTTP API and MQTT broker. The :class:`Client` class is the main entry point::
+HTTP API and MQTT broker.  The :class:`Client` class is the main entry
+point; use :meth:`~Client.device` to obtain :class:`Device` objects for
+per-device operations::
 
     import asyncio
     from socketry import Client
 
     client = await Client.login("email@example.com", "password")
-    props = await client.get_all_properties()
-    await client.set_property("ac", "on", wait=True)
+    devices = await client.fetch_devices()
+
+    device = client.device(0)
+    props = await device.get_all_properties()
+    await device.set_property("ac", "on", wait=True)
+
+    # Subscribe to real-time updates for all devices
+    sub = await client.subscribe(lambda sn, props: print(sn, props))
+    await sub.wait()
 """
 
 from __future__ import annotations
@@ -44,15 +53,146 @@ from socketry._crypto import (
 from socketry.properties import Setting, resolve
 
 
+class Device:
+    """A specific Jackery device.
+
+    Obtained via :meth:`Client.device`.  Provides per-device operations
+    without changing the global selected device on the parent
+    :class:`Client`.
+
+    Example::
+
+        device = client.device(0)
+        props = await device.get_all_properties()
+        await device.set_property("ac", "on")
+    """
+
+    def __init__(self, client: Client, dev_info: dict[str, object]) -> None:
+        self._client = client
+        self._sn = str(dev_info["devSn"])
+        self._id = str(dev_info.get("devId", ""))
+        self._name = str(dev_info.get("devName", self._sn))
+        self._model_code = int(str(dev_info.get("modelCode", 0) or 0))
+
+    @property
+    def sn(self) -> str:
+        """Serial number of this device."""
+        return self._sn
+
+    @property
+    def device_id(self) -> str:
+        """Internal device ID (used for HTTP property queries)."""
+        return self._id
+
+    @property
+    def name(self) -> str:
+        """Display name of this device."""
+        return self._name
+
+    @property
+    def model_code(self) -> int:
+        """Jackery model code."""
+        return self._model_code
+
+    async def get_all_properties(self) -> dict[str, object]:
+        """Fetch the full property map for this device.
+
+        Returns the raw ``data`` dict from the HTTP API, containing
+        ``device`` metadata and ``properties`` map.
+        """
+        if not self._id:
+            raise ValueError(f"Device {self._sn} has no deviceId.")
+        async with aiohttp.ClientSession() as session:
+            return await _fetch_device_properties(self._client.token, self._id, session)
+
+    async def get_property(self, name: str) -> tuple[Setting, object]:
+        """Fetch a single property by slug or raw key.
+
+        Returns ``(setting, raw_value)``.
+
+        Raises :class:`KeyError` if the property is unknown or not
+        reported by the device.
+        """
+        setting = resolve(name)
+        if setting is None:
+            raise KeyError(f"Unknown property '{name}'.")
+        data = await self.get_all_properties()
+        props = data.get("properties") or data
+        if not isinstance(props, dict) or setting.id not in props:
+            raise KeyError(f"Property '{name}' ({setting.id}) not reported by device.")
+        return setting, props[setting.id]
+
+    async def set_property(
+        self,
+        name: str,
+        value: str | int,
+        *,
+        wait: bool = False,
+        verbose: bool = False,
+    ) -> dict[str, object] | None:
+        """Change a device setting via MQTT.
+
+        Args:
+            name: Setting slug or raw key (e.g. ``"ac"``, ``"oac"``).
+            value: Named value (``"on"``, ``"off"``) or integer.
+            wait: If ``True``, wait for device confirmation.
+            verbose: Reserved for future debug logging.
+
+        Returns:
+            The device response body if *wait* is ``True`` and the device
+            responds, otherwise ``None``.
+
+        Raises:
+            KeyError: If the setting is unknown.
+            ValueError: If the setting is read-only or the value is invalid.
+        """
+        setting = resolve(name)
+        if setting is None:
+            raise KeyError(f"Unknown setting '{name}'.")
+        if not setting.writable:
+            raise ValueError(f"Property '{name}' is read-only.")
+
+        int_value = _resolve_value(setting, value)
+        body: dict[str, object] = {setting.prop_key: int_value}
+        assert setting.action_id is not None
+
+        if wait:
+            result = await self._client._publish_and_wait(
+                self._sn,
+                setting.action_id,
+                body,
+                expected_keys=set(body.keys()),
+                verbose=verbose,
+            )
+            if result is not None:
+                resp = result.get("body")
+                if isinstance(resp, dict):
+                    return resp
+            return None
+        else:
+            await self._client._publish_command(self._sn, setting.action_id, body)
+            return None
+
+
 class Client:
     """Jackery power station API client.
 
     Use :meth:`login` to authenticate, or :meth:`from_saved` to load
     previously saved credentials.
+
+    For multi-device use, obtain :class:`Device` objects via
+    :meth:`device` rather than the single-device selection pattern.
     """
 
     def __init__(self, credentials: dict[str, object]) -> None:
         self._creds = credentials
+        self._active_mqtt: aiomqtt.Client | None = None
+        self._pending_responses: list[
+            tuple[
+                Callable[[str, dict[str, object]], bool],
+                asyncio.Future[tuple[str, dict[str, object]]],
+            ]
+        ] = []
 
     # ------------------------------------------------------------------
     # Construction
@@ -149,12 +289,36 @@ class Client:
         self._creds["deviceName"] = dev["devName"]
         return dev
 
+    def device(self, index_or_sn: int | str) -> Device:
+        """Return a :class:`Device` for the given index or serial number.
+
+        Args:
+            index_or_sn: Zero-based index into :attr:`devices`, or the
+                device serial number string.
+
+        Raises:
+            IndexError: If an integer index is out of range, or no
+                devices are cached.
+            KeyError: If a serial-number string is not found.
+        """
+        devs = self.devices
+        if not devs:
+            raise IndexError("No cached device list. Call fetch_devices() first.")
+        if isinstance(index_or_sn, int):
+            if index_or_sn < 0 or index_or_sn >= len(devs):
+                raise IndexError(f"Invalid index {index_or_sn}. Must be 0..{len(devs) - 1}.")
+            return Device(self, devs[index_or_sn])
+        for dev in devs:
+            if dev["devSn"] == index_or_sn:
+                return Device(self, dev)
+        raise KeyError(f"No device with SN '{index_or_sn}'.")
+
     # ------------------------------------------------------------------
     # Status (HTTP)
     # ------------------------------------------------------------------
 
     async def get_all_properties(self) -> dict[str, object]:
-        """Fetch the full property map for the active device.
+        """Fetch the full property map for the selected device.
 
         Returns the raw ``data`` dict from the HTTP API, containing
         ``device`` metadata and ``properties`` map.
@@ -201,12 +365,15 @@ class Client:
         If *on_disconnect* is provided it is called whenever the broker
         disconnects and the loop is about to reconnect.
 
+        While a subscription is active, :meth:`set_property` and
+        :meth:`Device.set_property` publish commands through the shared
+        connection instead of opening a new one, avoiding broker
+        kick-offs.
+
         Returns a :class:`Subscription` whose :meth:`~Subscription.stop`
         method cancels the background listener.
         """
-        task = asyncio.create_task(
-            _subscribe_loop(self._creds, callback, on_disconnect=on_disconnect)
-        )
+        task = asyncio.create_task(self._run_subscribe_loop(callback, on_disconnect=on_disconnect))
         return Subscription(task)
 
     # ------------------------------------------------------------------
@@ -221,13 +388,13 @@ class Client:
         wait: bool = False,
         verbose: bool = False,
     ) -> dict[str, object] | None:
-        """Change a device setting via MQTT.
+        """Change the selected device's setting via MQTT.
 
         Args:
             name: Setting slug or raw key (e.g. ``"ac"``, ``"oac"``).
             value: Named value (``"on"``, ``"off"``) or integer.
             wait: If ``True``, wait for device confirmation.
-            verbose: If ``True``, log MQTT traffic.
+            verbose: Reserved for future debug logging.
 
         Returns:
             The device response body if *wait* is ``True`` and the device
@@ -248,15 +415,160 @@ class Client:
         assert setting.action_id is not None
 
         if wait:
-            result = await _publish_and_wait(self._creds, setting.action_id, body, verbose=verbose)
+            result = await self._publish_and_wait(
+                self.device_sn,
+                setting.action_id,
+                body,
+                expected_keys=set(body.keys()),
+                verbose=verbose,
+            )
             if result is not None:
                 resp = result.get("body")
                 if isinstance(resp, dict):
                     return resp
             return None
         else:
-            await _publish_command(self._creds, setting.action_id, body)
+            await self._publish_command(self.device_sn, setting.action_id, body)
             return None
+
+    # ------------------------------------------------------------------
+    # Private MQTT methods
+    # ------------------------------------------------------------------
+
+    async def _publish_command(
+        self, device_sn: str, action_id: int, body: dict[str, object]
+    ) -> None:
+        """Publish a device command, reusing the active connection if available."""
+        user_id = self._creds["userId"]
+        topic = f"hb/app/{user_id}/command"
+        payload = _build_command_payload(device_sn, action_id, body)
+
+        if self._active_mqtt is not None:
+            await self._active_mqtt.publish(topic, payload, qos=1)
+        else:
+            async with aiomqtt.Client(**_mqtt_params(self._creds)) as client:  # type: ignore[arg-type]
+                await client.publish(topic, payload, qos=1)
+
+    async def _publish_and_wait(
+        self,
+        device_sn: str,
+        action_id: int,
+        body: dict[str, object],
+        *,
+        expected_keys: set[str],
+        timeout: float = 10,
+        verbose: bool = False,
+    ) -> dict[str, object] | None:
+        """Publish a command and wait for the device to echo the commanded keys.
+
+        *expected_keys* is the set of property keys present in *body*.
+        Only a ``DevicePropertyChange`` message that contains at least
+        one of those keys (and matches *device_sn*) is accepted as the
+        confirmation — unrelated periodic status updates are ignored.
+
+        When a subscription is active the shared connection is used for
+        both publish and response dispatch; otherwise a short-lived
+        connection is opened.
+        """
+        user_id = self._creds["userId"]
+        cmd_topic = f"hb/app/{user_id}/command"
+        payload = _build_command_payload(device_sn, action_id, body)
+
+        def predicate(sn: str, props: dict[str, object]) -> bool:
+            return sn == device_sn and bool(expected_keys & props.keys())
+
+        if self._active_mqtt is not None:
+            # Shared connection path: register a pending response then publish.
+            future: asyncio.Future[tuple[str, dict[str, object]]] = (
+                asyncio.get_running_loop().create_future()
+            )
+            self._pending_responses.append((predicate, future))
+            await self._active_mqtt.publish(cmd_topic, payload, qos=1)
+            try:
+                async with asyncio.timeout(timeout):
+                    sn, props = await future
+                    return {
+                        "deviceSn": sn,
+                        "messageType": "DevicePropertyChange",
+                        "body": props,
+                    }
+            except TimeoutError:
+                self._pending_responses = [
+                    (p, f) for p, f in self._pending_responses if f is not future
+                ]
+                return None
+        else:
+            # No active subscription: open a short-lived connection.
+            dev_topic = f"hb/app/{user_id}/device"
+            async with aiomqtt.Client(**_mqtt_params(self._creds)) as mqtt_client:  # type: ignore[arg-type]
+                await mqtt_client.subscribe(dev_topic, qos=1)
+                await mqtt_client.publish(cmd_topic, payload, qos=1)
+                try:
+                    async with asyncio.timeout(timeout):
+                        async for message in mqtt_client.messages:
+                            parsed = _parse_device_update(message.payload)
+                            if parsed is None:
+                                continue
+                            msg_sn, props = parsed
+                            if predicate(msg_sn, props):
+                                return {
+                                    "deviceSn": msg_sn,
+                                    "messageType": "DevicePropertyChange",
+                                    "body": props,
+                                }
+                except TimeoutError:
+                    pass
+            return None
+
+    async def _run_subscribe_loop(
+        self,
+        callback: Callable[[str, dict[str, object]], Awaitable[None]],
+        *,
+        on_disconnect: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
+        """Persistent MQTT listener that sets ``_active_mqtt`` while connected.
+
+        Uses the standard client ID (``{userId}@APP``) because the Jackery
+        broker enforces ACLs tied to this identifier.  The shared
+        connection allows :meth:`_publish_command` and
+        :meth:`_publish_and_wait` to reuse it rather than opening a new
+        connection that would kick this subscription off.
+
+        Pending one-shot responses (from ``_publish_and_wait``) are
+        resolved before the user *callback* is invoked.
+        """
+        user_id = self._creds["userId"]
+        dev_topic = f"hb/app/{user_id}/device"
+        params = _mqtt_params(self._creds)
+
+        while True:
+            try:
+                async with aiomqtt.Client(**params) as mqtt_client:  # type: ignore[arg-type]
+                    self._active_mqtt = mqtt_client
+                    try:
+                        await mqtt_client.subscribe(dev_topic, qos=1)
+                        async for message in mqtt_client.messages:
+                            parsed = _parse_device_update(message.payload)
+                            if parsed is None:
+                                continue
+                            msg_sn, props = parsed
+                            # Resolve any pending _publish_and_wait futures first.
+                            for i, (pred, fut) in enumerate(self._pending_responses):
+                                if not fut.done() and pred(msg_sn, props):
+                                    fut.set_result((msg_sn, props))
+                                    self._pending_responses.pop(i)
+                                    break
+                            await callback(msg_sn, props)
+                    finally:
+                        self._active_mqtt = None
+            except aiomqtt.MqttError:
+                pass
+            # Notify and retry whether the disconnect was an error or a clean
+            # broker close (e.g. another client took the same MQTT client ID).
+            # CancelledError is NOT caught above, so stop() still works.
+            if on_disconnect is not None:
+                await on_disconnect()
+            await asyncio.sleep(_RECONNECT_INTERVAL)
 
 
 class Subscription:
@@ -505,19 +817,6 @@ def _build_command_payload(device_sn: str, action_id: int, body: dict[str, objec
     )
 
 
-async def _publish_command(
-    creds: dict[str, object], action_id: int, body: dict[str, object]
-) -> None:
-    """Connect to the MQTT broker and publish a device command."""
-    user_id = creds["userId"]
-    device_sn = str(creds["deviceSn"])
-    topic = f"hb/app/{user_id}/command"
-    payload = _build_command_payload(device_sn, action_id, body)
-
-    async with aiomqtt.Client(**_mqtt_params(creds)) as client:  # type: ignore[arg-type]
-        await client.publish(topic, payload, qos=1)
-
-
 def _parse_device_update(
     payload: bytes | bytearray,
 ) -> tuple[str, dict[str, object]] | None:
@@ -549,79 +848,3 @@ def _parse_device_update(
 
 
 _RECONNECT_INTERVAL = 5  # seconds between reconnection attempts
-
-
-async def _subscribe_loop(
-    creds: dict[str, object],
-    callback: Callable[[str, dict[str, object]], Awaitable[None]],
-    *,
-    on_disconnect: Callable[[], Awaitable[None]] | None = None,
-) -> None:
-    """Persistent MQTT listener that invokes *callback* for every update.
-
-    Uses the standard client ID (``{userId}@APP``) because the Jackery
-    broker enforces ACLs tied to this identifier.  When a one-shot
-    command (``set_property``) connects with the same ID the broker
-    disconnects this subscription, but the reconnection loop recovers
-    automatically.
-    """
-    user_id = creds["userId"]
-    dev_topic = f"hb/app/{user_id}/device"
-    params = _mqtt_params(creds)
-
-    while True:
-        try:
-            async with aiomqtt.Client(**params) as client:  # type: ignore[arg-type]
-                await client.subscribe(dev_topic, qos=1)
-                async for message in client.messages:
-                    parsed = _parse_device_update(message.payload)
-                    if parsed is not None:
-                        device_sn, properties = parsed
-                        await callback(device_sn, properties)
-        except aiomqtt.MqttError:
-            pass
-        # Notify and retry whether the disconnect was an error or a clean
-        # broker close (e.g. another client took the same MQTT client ID).
-        # CancelledError is NOT caught above, so stop() still works.
-        if on_disconnect is not None:
-            await on_disconnect()
-        await asyncio.sleep(_RECONNECT_INTERVAL)
-
-
-async def _publish_and_wait(
-    creds: dict[str, object],
-    action_id: int,
-    body: dict[str, object],
-    timeout: float = 10,
-    verbose: bool = False,
-) -> dict[str, object] | None:
-    """Publish a command and wait for a DevicePropertyChange response."""
-    user_id = creds["userId"]
-    device_sn = str(creds["deviceSn"])
-    cmd_topic = f"hb/app/{user_id}/command"
-    dev_topic = f"hb/app/{user_id}/device"
-    payload = _build_command_payload(device_sn, action_id, body)
-
-    async with aiomqtt.Client(**_mqtt_params(creds)) as client:  # type: ignore[arg-type]
-        await client.subscribe(dev_topic, qos=1)
-        await client.publish(cmd_topic, payload, qos=1)
-        try:
-            async with asyncio.timeout(timeout):
-                async for message in client.messages:
-                    parsed = _parse_device_update(message.payload)
-                    if parsed is None:
-                        continue
-                    msg_sn, props = parsed
-                    if msg_sn != device_sn:
-                        continue
-                    # _parse_device_update already filtered broker ACKs
-                    # Reconstruct the full message dict for the caller
-                    return {
-                        "deviceSn": msg_sn,
-                        "messageType": "DevicePropertyChange",
-                        "body": props,
-                    }
-        except TimeoutError:
-            pass
-
-    return None
