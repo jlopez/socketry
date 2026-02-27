@@ -7,6 +7,7 @@ import contextlib
 import json
 import re
 import ssl
+import time
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -19,7 +20,9 @@ from socketry.client import (
     Client,
     Device,
     Subscription,
+    TokenExpiredError,
     _build_command_payload,
+    _decode_jwt_exp,
     _fetch_all_devices,
     _fetch_device_properties,
     _http_login,
@@ -1349,3 +1352,267 @@ class TestDevice:
         dev = client.device(0)
         with pytest.raises(ValueError, match="read-only"):
             await dev.set_property("battery", "50")
+
+
+# ---------------------------------------------------------------------------
+# Token auto-refresh tests
+# ---------------------------------------------------------------------------
+
+
+def _make_fake_jwt(exp: int) -> str:
+    """Build a minimal unsigned JWT with the given exp claim (for testing only)."""
+    import base64 as _b64
+
+    header = _b64.urlsafe_b64encode(b'{"alg":"none"}').rstrip(b"=").decode()
+    payload_bytes = json.dumps({"exp": exp, "sub": "test"}).encode()
+    payload = _b64.urlsafe_b64encode(payload_bytes).rstrip(b"=").decode()
+    return f"{header}.{payload}.fakesig"
+
+
+class TestDecodeJwtExp:
+    def test_extracts_exp(self):
+        future = int(time.time()) + 86400
+        token = _make_fake_jwt(future)
+        result = _decode_jwt_exp(token)
+        assert result == float(future)
+
+    def test_expired_token(self):
+        past = int(time.time()) - 1000
+        token = _make_fake_jwt(past)
+        result = _decode_jwt_exp(token)
+        assert result == float(past)
+
+    def test_not_a_jwt(self):
+        assert _decode_jwt_exp("not-a-jwt") is None
+
+    def test_malformed_payload(self):
+        assert _decode_jwt_exp("a.!!!.c") is None
+
+    def test_missing_exp_claim(self):
+        import base64 as _b64
+
+        payload = _b64.urlsafe_b64encode(b'{"sub":"test"}').rstrip(b"=").decode()
+        assert _decode_jwt_exp(f"hdr.{payload}.sig") is None
+
+
+class TestHttpLoginStoresCredentials:
+    async def test_stores_password_and_token_exp(self):
+        future_exp = int(time.time()) + 86400 * 30
+        fake_token = _make_fake_jwt(future_exp)
+        login_response = {
+            "code": 0,
+            "token": fake_token,
+            "data": {"userId": "U001", "mqttPassWord": "bXF0dHB3"},
+        }
+        with aioresponses() as m:
+            m.post(_LOGIN_URL, payload=login_response)
+            _mock_device_endpoints(m, owned=[MOCK_OWNED_DEVICE])
+            creds = await _http_login("me@example.com", "secret")
+
+        assert creds["password"] == "secret"
+        assert creds["tokenExp"] == float(future_exp)
+
+    async def test_fetch_devices_false_skips_device_endpoints(self):
+        future_exp = int(time.time()) + 86400 * 30
+        fake_token = _make_fake_jwt(future_exp)
+        login_response = {
+            "code": 0,
+            "token": fake_token,
+            "data": {"userId": "U001", "mqttPassWord": "bXF0dHB3"},
+        }
+        with aioresponses() as m:
+            m.post(_LOGIN_URL, payload=login_response)
+            # No device endpoints registered — would fail if called
+            creds = await _http_login("me@example.com", "secret", fetch_devices=False)
+
+        assert creds["token"] == fake_token
+        assert creds["devices"] == []
+        assert creds["deviceSn"] == ""
+
+    async def test_undecodable_token_gives_none_exp(self):
+        login_response = {
+            "code": 0,
+            "token": "opaque-token",
+            "data": {"userId": "U001", "mqttPassWord": "bXF0dHB3"},
+        }
+        with aioresponses() as m:
+            m.post(_LOGIN_URL, payload=login_response)
+            _mock_device_endpoints(m)
+            creds = await _http_login("me@example.com", "secret")
+
+        assert creds["tokenExp"] is None
+
+
+class TestTokenExpiredErrorRaised:
+    async def test_fetch_device_properties_raises_on_10402(self):
+        with aioresponses() as m:
+            m.get(_PROPERTY_URL, payload={"code": 10402, "msg": "Token expired"})
+            async with aiohttp.ClientSession() as session:
+                with pytest.raises(TokenExpiredError):
+                    await _fetch_device_properties("expired-token", "DEV001", session)
+
+    async def test_fetch_all_devices_raises_on_10402(self):
+        with aioresponses() as m:
+            m.get(
+                f"{API_BASE}/device/bind/list",
+                payload={"code": 10402, "msg": "Token expired"},
+            )
+            async with aiohttp.ClientSession() as session:
+                with pytest.raises(TokenExpiredError):
+                    await _fetch_all_devices("expired-token", session)
+
+
+class TestEnsureFreshToken:
+    def _creds_with_exp(self, exp: float) -> dict[str, Any]:
+        return {
+            "token": "old-token",
+            "mqttPassWord": "old-pw",
+            "tokenExp": exp,
+            "email": "me@example.com",
+            "password": "secret",
+            "userId": "U001",
+        }
+
+    async def test_no_refresh_when_token_is_fresh(self):
+        far_future = time.time() + 86400 * 29  # 29 days from now
+        client = Client(self._creds_with_exp(far_future))
+
+        with patch("socketry.client._http_login") as mock_login:
+            await client._ensure_fresh_token()
+
+        mock_login.assert_not_called()
+
+    async def test_refreshes_when_within_buffer(self):
+        soon = time.time() + 1800  # 30 min from now (< 1 hour buffer)
+        future_exp = time.time() + 86400 * 30
+        new_creds = {
+            "token": "new-token",
+            "mqttPassWord": "new-pw",
+            "tokenExp": future_exp,
+        }
+        client = Client(self._creds_with_exp(soon))
+
+        with patch("socketry.client._http_login", return_value=new_creds) as mock_login:
+            await client._ensure_fresh_token()
+
+        mock_login.assert_awaited_once_with("me@example.com", "secret", fetch_devices=False)
+        assert client.token == "new-token"
+        assert client._creds["mqttPassWord"] == "new-pw"
+        assert client._creds["tokenExp"] == future_exp
+
+    async def test_refreshes_when_token_exp_is_none(self):
+        """If tokenExp is None (e.g. opaque token), always refresh."""
+        new_creds = {"token": "new-tok", "mqttPassWord": "new-pw", "tokenExp": None}
+        client = Client(
+            {
+                "token": "old",
+                "mqttPassWord": "old-pw",
+                "tokenExp": None,
+                "email": "x@x.com",
+                "password": "pw",
+            }
+        )
+
+        with patch("socketry.client._http_login", return_value=new_creds) as mock_login:
+            await client._ensure_fresh_token()
+
+        mock_login.assert_awaited_once()
+        assert client.token == "new-tok"
+
+    async def test_no_refresh_without_password(self):
+        """If no password in creds, skip refresh silently (backwards compat)."""
+        client = Client({"token": "tok", "tokenExp": 0.0, "email": "x@x.com"})
+
+        with patch("socketry.client._http_login") as mock_login:
+            await client._ensure_fresh_token()
+
+        mock_login.assert_not_called()
+
+    async def test_concurrent_calls_refresh_once(self):
+        """Concurrent calls to _ensure_fresh_token only trigger one login."""
+        soon = time.time() + 1800
+        new_creds = {"token": "new", "mqttPassWord": "mpw", "tokenExp": time.time() + 86400 * 30}
+        client = Client(self._creds_with_exp(soon))
+        call_count = 0
+
+        async def slow_login(*args: object, **kwargs: object) -> dict[str, Any]:
+            nonlocal call_count
+            call_count += 1
+            await asyncio.sleep(0.05)
+            return new_creds
+
+        with patch("socketry.client._http_login", side_effect=slow_login):
+            await asyncio.gather(
+                client._ensure_fresh_token(),
+                client._ensure_fresh_token(),
+                client._ensure_fresh_token(),
+            )
+
+        assert call_count == 1
+
+
+class TestReactiveTokenRefresh:
+    """Token refresh triggered by 10402 errors from the API."""
+
+    def _creds_with_password(self) -> dict[str, Any]:
+        return {
+            **MOCK_CREDS,
+            "password": "secret",
+            "email": "me@example.com",
+            "tokenExp": time.time() + 86400 * 30,  # fresh, proactive won't trigger
+        }
+
+    async def test_fetch_devices_retries_on_10402(self):
+        new_token_creds = {"token": "new-tok", "mqttPassWord": "mpw", "tokenExp": None}
+        client = Client(self._creds_with_password())
+
+        with aioresponses() as m:
+            # First call returns 10402
+            m.get(f"{API_BASE}/device/bind/list", payload={"code": 10402})
+            # Second call (after re-auth) succeeds
+            m.get(f"{API_BASE}/device/bind/list", payload={"data": [MOCK_OWNED_DEVICE]})
+            m.get(f"{API_BASE}/device/bind/shared", payload={"data": {}})
+
+            with patch("socketry.client._http_login", return_value=new_token_creds):
+                devices = await client.fetch_devices()
+
+        assert len(devices) == 1
+        assert client.token == "new-tok"
+
+    async def test_get_all_properties_retries_on_10402(self):
+        new_token_creds = {"token": "new-tok", "mqttPassWord": "mpw", "tokenExp": None}
+        client = Client({**self._creds_with_password(), "deviceId": "DEV001"})
+        mock_data: dict[str, Any] = {"properties": {"rb": 80}}
+
+        with aioresponses() as m:
+            m.get(_PROPERTY_URL, payload={"code": 10402})
+            m.get(_PROPERTY_URL, payload={"code": 0, "data": mock_data})
+
+            with patch("socketry.client._http_login", return_value=new_token_creds):
+                result = await client.get_all_properties()
+
+        assert result["properties"]["rb"] == 80  # type: ignore[index]
+        assert client.token == "new-tok"
+
+    async def test_device_get_all_properties_retries_on_10402(self):
+        new_token_creds = {"token": "new-tok", "mqttPassWord": "mpw", "tokenExp": None}
+        client = Client(
+            {
+                **self._creds_with_password(),
+                "devices": [
+                    {"devSn": "SN001", "devId": "DEV001", "devName": "Station", "modelCode": 2}
+                ],
+            }
+        )
+        dev = client.device(0)
+        mock_data: dict[str, Any] = {"properties": {"rb": 77}}
+
+        with aioresponses() as m:
+            m.get(_PROPERTY_URL, payload={"code": 10402})
+            m.get(_PROPERTY_URL, payload={"code": 0, "data": mock_data})
+
+            with patch("socketry.client._http_login", return_value=new_token_creds):
+                result = await dev.get_all_properties()
+
+        assert result["properties"]["rb"] == 77  # type: ignore[index]
+        assert client.token == "new-tok"

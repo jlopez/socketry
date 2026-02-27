@@ -52,6 +52,12 @@ from socketry._crypto import (
 )
 from socketry.properties import Setting, resolve
 
+_TOKEN_EXPIRY_BUFFER = 3600  # seconds before expiry to trigger proactive refresh
+
+
+class TokenExpiredError(RuntimeError):
+    """Raised when the Jackery API returns error code 10402 (token expired)."""
+
 
 class Device:
     """A specific Jackery device.
@@ -102,8 +108,14 @@ class Device:
         """
         if not self._id:
             raise ValueError(f"Device {self._sn} has no deviceId.")
+        await self._client._ensure_fresh_token()
         async with aiohttp.ClientSession() as session:
-            return await _fetch_device_properties(self._client.token, self._id, session)
+            try:
+                return await _fetch_device_properties(self._client.token, self._id, session)
+            except TokenExpiredError:
+                self._client._creds["tokenExp"] = 0
+                await self._client._ensure_fresh_token()
+                return await _fetch_device_properties(self._client.token, self._id, session)
 
     async def get_property(self, name: str) -> tuple[Setting, object]:
         """Fetch a single property by slug or raw key.
@@ -193,6 +205,7 @@ class Client:
                 asyncio.Future[tuple[str, dict[str, object]]],
             ]
         ] = []
+        self._refresh_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # Construction
@@ -260,6 +273,42 @@ class Client:
         return str(self._creds.get("token", ""))
 
     # ------------------------------------------------------------------
+    # Token refresh
+    # ------------------------------------------------------------------
+
+    async def _ensure_fresh_token(self) -> None:
+        """Proactively re-authenticate if the token is within the expiry buffer.
+
+        Reads ``email`` and ``password`` from stored credentials and calls
+        :func:`_http_login` without fetching devices.  Only the auth fields
+        (``token``, ``mqttPassWord``, ``tokenExp``) are updated so that the
+        device selection is preserved.
+
+        No-ops silently when credentials lack an email/password (e.g. a client
+        built from a credentials dict that predates this feature).
+        """
+        exp = self._creds.get("tokenExp")
+        if exp is not None and time.time() < float(str(exp)) - _TOKEN_EXPIRY_BUFFER:
+            return
+
+        email = str(self._creds.get("email", ""))
+        password = str(self._creds.get("password", ""))
+        if not email or not password:
+            return
+
+        async with self._refresh_lock:
+            # Re-check after acquiring the lock: another task may have already
+            # refreshed while we were waiting.
+            exp = self._creds.get("tokenExp")
+            if exp is not None and time.time() < float(str(exp)) - _TOKEN_EXPIRY_BUFFER:
+                return
+
+            new_creds = await _http_login(email, password, fetch_devices=False)
+            self._creds["token"] = new_creds["token"]
+            self._creds["mqttPassWord"] = new_creds["mqttPassWord"]
+            self._creds["tokenExp"] = new_creds.get("tokenExp")
+
+    # ------------------------------------------------------------------
     # Device management
     # ------------------------------------------------------------------
 
@@ -268,8 +317,14 @@ class Client:
 
         Updates the internal cache and returns all devices.
         """
+        await self._ensure_fresh_token()
         async with aiohttp.ClientSession() as session:
-            all_devices = await _fetch_all_devices(self.token, session)
+            try:
+                all_devices = await _fetch_all_devices(self.token, session)
+            except TokenExpiredError:
+                self._creds["tokenExp"] = 0
+                await self._ensure_fresh_token()
+                all_devices = await _fetch_all_devices(self.token, session)
         self._creds["devices"] = all_devices
         return all_devices
 
@@ -325,8 +380,14 @@ class Client:
         """
         if not self.device_id:
             raise ValueError("No deviceId. Call login() or select_device() first.")
+        await self._ensure_fresh_token()
         async with aiohttp.ClientSession() as session:
-            return await _fetch_device_properties(self.token, self.device_id, session)
+            try:
+                return await _fetch_device_properties(self.token, self.device_id, session)
+            except TokenExpiredError:
+                self._creds["tokenExp"] = 0
+                await self._ensure_fresh_token()
+                return await _fetch_device_properties(self.token, self.device_id, session)
 
     async def get_property(self, name: str) -> tuple[Setting, object]:
         """Fetch a single property by slug or raw key.
@@ -539,10 +600,11 @@ class Client:
         """
         user_id = self._creds["userId"]
         dev_topic = f"hb/app/{user_id}/device"
-        params = _mqtt_params(self._creds)
 
         while True:
+            await self._ensure_fresh_token()
             try:
+                params = _mqtt_params(self._creds)
                 async with aiomqtt.Client(**params) as mqtt_client:  # type: ignore[arg-type]
                     self._active_mqtt = mqtt_client
                     try:
@@ -602,6 +664,24 @@ class Subscription:
 # ---------------------------------------------------------------------------
 
 
+def _decode_jwt_exp(token: str) -> float | None:
+    """Extract the ``exp`` claim from a JWT without verifying the signature.
+
+    Returns the expiry as a Unix timestamp (float), or ``None`` if the token
+    cannot be decoded (e.g. not a JWT, malformed base64, missing claim).
+    """
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            return None
+        # base64url padding: length must be a multiple of 4
+        padded = parts[1] + "=" * (-len(parts[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded))
+        return float(payload["exp"])
+    except Exception:
+        return None
+
+
 def _resolve_value(setting: Setting, value: str | int) -> int:
     """Convert a user-facing value to the integer used in MQTT commands."""
     if isinstance(value, int):
@@ -621,8 +701,16 @@ def _resolve_value(setting: Setting, value: str | int) -> int:
         ) from None
 
 
-async def _http_login(email: str, password: str) -> dict[str, object]:
-    """Perform the encrypted HTTP login and return credentials."""
+async def _http_login(
+    email: str, password: str, *, fetch_devices: bool = True
+) -> dict[str, object]:
+    """Perform the encrypted HTTP login and return credentials.
+
+    When *fetch_devices* is ``False`` the device list is not fetched —
+    ``devices`` will be an empty list and the device selection fields will
+    be empty strings.  This is used by :meth:`Client._ensure_fresh_token`
+    to avoid redundant API calls when only the auth token needs refreshing.
+    """
     mac_id = get_mac_id()
     login_bean = json.dumps(
         {
@@ -664,17 +752,19 @@ async def _http_login(email: str, password: str) -> dict[str, object]:
         data = body["data"]
         token = body["token"]
 
-        all_devices = await _fetch_all_devices(token, session)
+        all_devices = await _fetch_all_devices(token, session) if fetch_devices else []
 
     creds: dict[str, object] = {
         "userId": data["userId"],
         "mqttPassWord": data["mqttPassWord"],
         "token": token,
+        "tokenExp": _decode_jwt_exp(token),
+        "email": email,
+        "password": password,
+        "macId": mac_id,
         "deviceSn": "",
         "deviceId": "",
         "deviceName": "",
-        "email": email,
-        "macId": mac_id,
         "devices": all_devices,
     }
 
@@ -699,6 +789,8 @@ async def _fetch_all_devices(token: str, session: aiohttp.ClientSession) -> list
     ) as dev_resp:
         dev_resp.raise_for_status()
         dev_body = await dev_resp.json()
+    if dev_body.get("code") == 10402:
+        raise TokenExpiredError("Token expired (10402)")
     for d in dev_body.get("data") or []:
         all_devices.append(
             {
@@ -762,6 +854,8 @@ async def _fetch_device_properties(
     ) as resp:
         resp.raise_for_status()
         body = await resp.json()
+    if body.get("code") == 10402:
+        raise TokenExpiredError("Token expired (10402)")
     if body.get("code") != 0:
         msg = body.get("msg", "unknown error")
         raise RuntimeError(f"Property fetch failed: {msg}")
