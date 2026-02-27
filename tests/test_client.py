@@ -1528,6 +1528,56 @@ class TestEnsureFreshToken:
 
         mock_login.assert_not_called()
 
+    async def test_persists_credentials_after_refresh(self, tmp_path, monkeypatch):
+        """After a refresh, from_saved() clients persist new credentials to disk."""
+        soon = time.time() + 1800
+        new_creds = {
+            "token": "new-tok",
+            "mqttPassWord": "mpw",
+            "tokenExp": time.time() + 86400 * 30,
+        }
+
+        cred_dir = tmp_path / "config"
+        cred_file = cred_dir / "credentials.json"
+        cred_dir.mkdir()
+        cred_file.write_text(json.dumps(self._creds_with_exp(soon)))
+        cred_file.chmod(0o600)
+        monkeypatch.setattr("socketry.client.CRED_DIR", cred_dir)
+        monkeypatch.setattr("socketry.client.CRED_FILE", cred_file)
+
+        client = Client.from_saved()
+        with patch("socketry.client._http_login", return_value=new_creds):
+            await client._ensure_fresh_token()
+
+        saved = json.loads(cred_file.read_text())
+        assert saved["token"] == "new-tok"
+
+    async def test_no_persist_for_programmatic_client(self, tmp_path, monkeypatch):
+        """Clients constructed directly (not from_saved) do NOT auto-save after refresh."""
+        soon = time.time() + 1800
+        new_creds = {
+            "token": "new-tok",
+            "mqttPassWord": "mpw",
+            "tokenExp": time.time() + 86400 * 30,
+        }
+
+        cred_dir = tmp_path / "config"
+        cred_file = cred_dir / "credentials.json"
+        cred_dir.mkdir()
+        original = json.dumps(self._creds_with_exp(soon))
+        cred_file.write_text(original)
+        cred_file.chmod(0o600)
+        monkeypatch.setattr("socketry.client.CRED_DIR", cred_dir)
+        monkeypatch.setattr("socketry.client.CRED_FILE", cred_file)
+
+        # Constructed directly, NOT from_saved()
+        client = Client(self._creds_with_exp(soon))
+        with patch("socketry.client._http_login", return_value=new_creds):
+            await client._ensure_fresh_token()
+
+        # File should be unchanged
+        assert cred_file.read_text() == original
+
     async def test_concurrent_calls_refresh_once(self):
         """Concurrent calls to _ensure_fresh_token only trigger one login."""
         soon = time.time() + 1800

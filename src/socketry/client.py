@@ -196,8 +196,9 @@ class Client:
     :meth:`device` rather than the single-device selection pattern.
     """
 
-    def __init__(self, credentials: dict[str, object]) -> None:
+    def __init__(self, credentials: dict[str, object], *, auto_save: bool = False) -> None:
         self._creds = credentials
+        self._auto_save = auto_save
         self._active_mqtt: aiomqtt.Client | None = None
         self._pending_responses: list[
             tuple[
@@ -232,7 +233,7 @@ class Client:
                 f"No saved credentials at {CRED_FILE}. Call Client.login() first."
             )
         creds = json.loads(CRED_FILE.read_text())
-        return cls(creds)
+        return cls(creds, auto_save=True)
 
     def save_credentials(self) -> None:
         """Persist credentials to ``~/.config/socketry/credentials.json``."""
@@ -307,6 +308,10 @@ class Client:
             self._creds["token"] = new_creds["token"]
             self._creds["mqttPassWord"] = new_creds["mqttPassWord"]
             self._creds["tokenExp"] = new_creds.get("tokenExp")
+            # Persist immediately so the next process doesn't re-login unnecessarily.
+            # Only auto-save for clients that were loaded from disk (from_saved()).
+            if self._auto_save:
+                self.save_credentials()
 
     # ------------------------------------------------------------------
     # Device management
