@@ -1,7 +1,7 @@
 # socketry
 
 [![CI](https://github.com/jlopez/socketry/actions/workflows/ci.yml/badge.svg)](https://github.com/jlopez/socketry/actions/workflows/ci.yml)
-![Coverage](https://img.shields.io/badge/coverage-59%25-orange)
+![Coverage](https://img.shields.io/badge/coverage-68%25-yellow)
 ![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue)
 
 Python API and CLI for controlling Jackery portable power stations.
@@ -152,6 +152,30 @@ Writable settings:
 | `sfc` | on / off | Super fast charge |
 | `ups` | on / off | UPS mode |
 
+### Watching live updates (`watch`)
+
+```bash
+# Stream all property changes in real time
+socketry watch
+
+# Filter to a single property
+socketry watch battery
+
+# Example output:
+# [14:32:01] 855124121010657 Output power (output-power): 182W
+# [14:32:05] 855124121010657 Battery (battery): 85%
+# [14:32:10] Disconnected, reconnecting...
+# [14:32:15] 855124121010657 Battery (battery): 84%
+```
+
+Press Ctrl+C to stop. The connection automatically reconnects if the broker
+disconnects (e.g. when a `set` command runs from another terminal).
+
+> **Note:** The Jackery broker only allows one MQTT connection per account.
+> Running `socketry set` while `watch` is active will briefly disconnect the
+> watcher. It reconnects automatically, but updates during the reconnection
+> window are lost.
+
 ## Library usage
 
 ```python
@@ -179,6 +203,17 @@ async def main():
     await client.set_property("ac", "on")
     result = await client.set_property("light", "high", wait=True)
 
+    # Subscribe to real-time updates
+    async def on_update(device_sn: str, properties: dict) -> None:
+        print(f"{device_sn}: {properties}")
+
+    async def on_disconnect() -> None:
+        print("Reconnecting...")
+
+    subscription = await client.subscribe(on_update, on_disconnect=on_disconnect)
+    # ... later
+    await subscription.stop()
+
 asyncio.run(main())
 ```
 
@@ -196,7 +231,7 @@ protocol specification.
 
 ## Roadmap
 
-- [ ] MQTT real-time monitor (subscribe to live property changes)
+- [x] MQTT real-time monitor (`socketry watch` + `client.subscribe()`)
 - [ ] Token auto-refresh (JWT expires ~30 days)
 
 ## License

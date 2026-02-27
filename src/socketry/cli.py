@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import sys
+from datetime import datetime
 
 import typer
 
@@ -343,3 +345,69 @@ def set_setting(
             typer.echo("No response from device (timeout).", err=True)
     else:
         typer.echo(f"Command sent to {client.device_name}.")
+
+
+@app.command()
+def watch(
+    name: str | None = typer.Argument(None, help="Property name to filter (optional)"),
+) -> None:
+    """Watch real-time property updates from the device via MQTT.
+
+    \b
+    Without arguments, shows all property changes.
+    With a property name, shows only that property.
+    Press Ctrl+C to stop.
+    """
+    client = _ensure_client()
+
+    setting: Setting | None = None
+    if name is not None:
+        setting = resolve(name)
+        if setting is None:
+            typer.echo(f"Unknown property '{name}'.", err=True)
+            raise typer.Exit(1)
+
+    with contextlib.suppress(KeyboardInterrupt):
+        asyncio.run(_watch_async(client, setting))
+
+
+async def _watch_async(client: Client, setting: Setting | None) -> None:
+    """Async implementation of the watch command."""
+    is_tty = sys.stdout.isatty()
+    if setting:
+        typer.echo(f"Watching {setting.name} ({setting.slug})... (Ctrl+C to stop)")
+    else:
+        typer.echo("Watching for property updates... (Ctrl+C to stop)")
+
+    async def on_update(device_sn: str, properties: dict[str, object]) -> None:
+        ts = datetime.now().strftime("%H:%M:%S")
+        for key, value in properties.items():
+            if setting and key != setting.id:
+                continue
+            s = _by_id.get(key)
+            if s:
+                label = f"{s.name} ({s.slug})"
+                formatted = s.format_value(value)
+            else:
+                label = key
+                formatted = str(value)
+            if is_tty:
+                typer.echo(
+                    f"[{ts}] {typer.style(device_sn, bold=True)} "
+                    f"{typer.style(label, fg='cyan')}: {formatted}"
+                )
+            else:
+                typer.echo(f"[{ts}] {device_sn} {label}: {formatted}")
+
+    async def on_disconnect() -> None:
+        ts = datetime.now().strftime("%H:%M:%S")
+        if is_tty:
+            typer.echo(typer.style(f"[{ts}] Disconnected, reconnecting...", fg="yellow"))
+        else:
+            typer.echo(f"[{ts}] Disconnected, reconnecting...")
+
+    subscription = await client.subscribe(on_update, on_disconnect=on_disconnect)
+    try:
+        await subscription.wait()
+    finally:
+        await subscription.stop()

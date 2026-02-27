@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import re
 import ssl
@@ -15,15 +17,18 @@ from aioresponses import aioresponses
 from socketry._constants import API_BASE, MQTT_HOST, MQTT_PORT
 from socketry.client import (
     Client,
+    Subscription,
     _build_command_payload,
     _fetch_all_devices,
     _fetch_device_properties,
     _http_login,
     _make_tls_context,
     _mqtt_params,
+    _parse_device_update,
     _publish_and_wait,
     _publish_command,
     _resolve_value,
+    _subscribe_loop,
 )
 from socketry.properties import Setting
 
@@ -493,6 +498,11 @@ def _make_mock_mqtt_client(
 
     Args:
         messages: List of message payloads to yield from client.messages.
+
+    The message generator blocks forever after exhausting *messages*,
+    mirroring real MQTT behaviour (the iterator only ends on disconnect).
+    This ensures ``async for`` always suspends, which is required for
+    ``task.cancel()`` to deliver ``CancelledError``.
     """
     mock_client = AsyncMock()
     mock_client.publish = AsyncMock()
@@ -503,6 +513,8 @@ def _make_mock_mqtt_client(
             msg = MagicMock()
             msg.payload = payload
             yield msg
+        # Block forever — a real MQTT connection waits for the next message.
+        await asyncio.Event().wait()
 
     mock_client.messages = _message_generator()
 
@@ -581,7 +593,7 @@ class TestPublishAndWait:
             result = await _publish_and_wait(MOCK_CREDS, 4, {"oac": 1})
 
         assert result is not None
-        assert result["body"] == response_body
+        assert result["body"] == {"oac": 1}  # messageId stripped by parser
         assert result["deviceSn"] == "SN001"
 
     async def test_subscribes_before_publish(self):
@@ -613,7 +625,7 @@ class TestPublishAndWait:
             result = await _publish_and_wait(MOCK_CREDS, 4, {"oac": 1})
 
         assert result is not None
-        assert result["body"] == {"oac": 1, "messageId": 123}
+        assert result["body"] == {"oac": 1}  # messageId stripped
 
     async def test_filters_by_device_sn(self):
         messages = [
@@ -716,7 +728,7 @@ class TestSetProperty:
             client = Client({**MOCK_CREDS})
             result = await client.set_property("ac", "on", wait=True)
 
-        assert result == response_body
+        assert result == {"oac": 1}  # messageId stripped by parser
 
     async def test_wait_timeout_returns_none(self):
         mock_cm, _ = _make_mock_mqtt_client([])
@@ -741,3 +753,271 @@ class TestSetProperty:
         client = Client({**MOCK_CREDS})
         with pytest.raises(ValueError, match="Invalid value"):
             await client.set_property("ac", "maybe")
+
+
+# ---------------------------------------------------------------------------
+# _parse_device_update tests
+# ---------------------------------------------------------------------------
+
+
+class TestParseDeviceUpdate:
+    def _update(self, body: dict[str, Any], device_sn: str = "SN001") -> bytes:
+        return json.dumps(
+            {
+                "deviceSn": device_sn,
+                "messageType": "DevicePropertyChange",
+                "body": body,
+            }
+        ).encode()
+
+    def test_valid_update(self):
+        result = _parse_device_update(self._update({"oac": 1, "messageId": 123}))
+        assert result is not None
+        sn, props = result
+        assert sn == "SN001"
+        assert props == {"oac": 1}  # messageId stripped
+
+    def test_strips_message_id(self):
+        result = _parse_device_update(self._update({"rb": 85, "messageId": 999}))
+        assert result is not None
+        _, props = result
+        assert "messageId" not in props
+        assert props == {"rb": 85}
+
+    def test_non_json_returns_none(self):
+        assert _parse_device_update(b"not json") is None
+
+    def test_missing_device_sn_returns_none(self):
+        payload = json.dumps({"messageType": "DevicePropertyChange", "body": {"oac": 1}}).encode()
+        assert _parse_device_update(payload) is None
+
+    def test_wrong_message_type_returns_none(self):
+        payload = json.dumps(
+            {"deviceSn": "SN001", "messageType": "SomeOther", "body": {"oac": 1}}
+        ).encode()
+        assert _parse_device_update(payload) is None
+
+    def test_non_dict_body_returns_none(self):
+        payload = json.dumps(
+            {"deviceSn": "SN001", "messageType": "DevicePropertyChange", "body": "str"}
+        ).encode()
+        assert _parse_device_update(payload) is None
+
+    def test_broker_ack_returns_none(self):
+        payload = json.dumps(
+            {
+                "deviceSn": "SN001",
+                "messageType": "DevicePropertyChange",
+                "body": {"messageId": 0},
+            }
+        ).encode()
+        assert _parse_device_update(payload) is None
+
+    def test_integer_device_sn_returns_none(self):
+        payload = json.dumps(
+            {"deviceSn": 12345, "messageType": "DevicePropertyChange", "body": {"oac": 1}}
+        ).encode()
+        assert _parse_device_update(payload) is None
+
+
+# ---------------------------------------------------------------------------
+# Subscription tests
+# ---------------------------------------------------------------------------
+
+
+class TestSubscribeLoop:
+    def _device_message(self, body: dict[str, Any], device_sn: str = "SN001") -> bytes:
+        return json.dumps(
+            {
+                "deviceSn": device_sn,
+                "messageType": "DevicePropertyChange",
+                "body": body,
+            }
+        ).encode()
+
+    async def test_calls_callback_with_parsed_updates(self):
+        messages = [
+            self._device_message({"oac": 1}),
+            self._device_message({"rb": 85}, device_sn="SN002"),
+        ]
+        mock_cm, mock_client = _make_mock_mqtt_client(messages)
+        received: list[tuple[str, dict[str, object]]] = []
+        got_all = asyncio.Event()
+
+        async def callback(sn: str, props: dict[str, object]) -> None:
+            received.append((sn, props))
+            if len(received) == 2:
+                got_all.set()
+
+        with patch("socketry.client.aiomqtt.Client", return_value=mock_cm):
+            task = asyncio.create_task(_subscribe_loop(MOCK_CREDS, callback))
+            await asyncio.wait_for(got_all.wait(), timeout=2)
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        assert len(received) == 2
+        assert received[0] == ("SN001", {"oac": 1})
+        assert received[1] == ("SN002", {"rb": 85})
+
+    async def test_skips_invalid_messages(self):
+        messages = [
+            b"not json",
+            self._device_message({"messageId": 0}),  # broker ACK
+            self._device_message({"oac": 1}),
+        ]
+        mock_cm, mock_client = _make_mock_mqtt_client(messages)
+        received: list[tuple[str, dict[str, object]]] = []
+        got_one = asyncio.Event()
+
+        async def callback(sn: str, props: dict[str, object]) -> None:
+            received.append((sn, props))
+            got_one.set()
+
+        with patch("socketry.client.aiomqtt.Client", return_value=mock_cm):
+            task = asyncio.create_task(_subscribe_loop(MOCK_CREDS, callback))
+            await asyncio.wait_for(got_one.wait(), timeout=2)
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        assert len(received) == 1
+        assert received[0] == ("SN001", {"oac": 1})
+
+    async def test_subscribes_to_device_topic(self):
+        mock_cm, mock_client = _make_mock_mqtt_client([])
+
+        async def callback(sn: str, props: dict[str, object]) -> None:
+            pass
+
+        with patch("socketry.client.aiomqtt.Client", return_value=mock_cm):
+            task = asyncio.create_task(_subscribe_loop(MOCK_CREDS, callback))
+            await asyncio.sleep(0)  # let the loop subscribe
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        mock_client.subscribe.assert_awaited_once()
+        sub_args = mock_client.subscribe.call_args
+        assert sub_args[0][0] == "hb/app/U001/device"
+        assert sub_args[1]["qos"] == 1
+
+    async def test_uses_standard_client_id(self):
+        """Subscription uses the standard client ID (broker ACLs require it)."""
+        mock_cm, _ = _make_mock_mqtt_client([])
+
+        async def callback(sn: str, props: dict[str, object]) -> None:
+            pass
+
+        with patch("socketry.client.aiomqtt.Client", return_value=mock_cm) as mock_cls:
+            task = asyncio.create_task(_subscribe_loop(MOCK_CREDS, callback))
+            await asyncio.sleep(0)
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        call_kwargs = mock_cls.call_args[1]
+        assert call_kwargs["identifier"] == "U001@APP"
+
+    async def test_reconnects_on_mqtt_error(self):
+        """Should reconnect after an MqttError from the broker."""
+        import aiomqtt as _aiomqtt
+
+        call_count = 0
+        got_message = asyncio.Event()
+
+        # First call raises MqttError, second succeeds with a message
+        def make_client(**kwargs: object) -> AsyncMock:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                cm = AsyncMock()
+                cm.__aenter__ = AsyncMock(side_effect=_aiomqtt.MqttError("disconnected"))
+                cm.__aexit__ = AsyncMock(return_value=False)
+                return cm
+            msg_payload = json.dumps(
+                {"deviceSn": "SN001", "messageType": "DevicePropertyChange", "body": {"oac": 1}}
+            ).encode()
+            return _make_mock_mqtt_client([msg_payload])[0]
+
+        received: list[tuple[str, dict[str, object]]] = []
+
+        async def callback(sn: str, props: dict[str, object]) -> None:
+            received.append((sn, props))
+            got_message.set()
+
+        with (
+            patch("socketry.client.aiomqtt.Client", side_effect=make_client),
+            patch("socketry.client._RECONNECT_INTERVAL", 0),
+        ):
+            task = asyncio.create_task(_subscribe_loop(MOCK_CREDS, callback))
+            await asyncio.wait_for(got_message.wait(), timeout=2)
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        assert call_count >= 2
+        assert received == [("SN001", {"oac": 1})]
+
+
+class TestSubscription:
+    async def test_stop_cancels_task(self):
+        """stop() should cancel the background task and return cleanly."""
+
+        async def block_forever() -> None:
+            await asyncio.Event().wait()
+
+        task = asyncio.create_task(block_forever())
+        sub = Subscription(task)
+        await sub.stop()
+        assert task.done()
+
+    async def test_stop_handles_failed_task(self):
+        """stop() should not raise if the task already failed with an exception."""
+
+        async def fail() -> None:
+            raise RuntimeError("connection lost")
+
+        task = asyncio.create_task(fail())
+        await asyncio.sleep(0)  # let the task fail
+        sub = Subscription(task)
+        await sub.stop()  # should not raise
+        assert task.done()
+
+    async def test_wait_returns_when_task_completes(self):
+        """wait() should return once the background task finishes."""
+
+        async def quick() -> None:
+            return
+
+        task = asyncio.create_task(quick())
+        sub = Subscription(task)
+        await sub.wait()
+        assert task.done()
+
+
+class TestClientSubscribe:
+    async def test_returns_subscription_and_receives_updates(self):
+        update_msg = json.dumps(
+            {
+                "deviceSn": "SN001",
+                "messageType": "DevicePropertyChange",
+                "body": {"oac": 1},
+            }
+        ).encode()
+        mock_cm, _ = _make_mock_mqtt_client([update_msg])
+        received: list[tuple[str, dict[str, object]]] = []
+        got_message = asyncio.Event()
+
+        async def callback(sn: str, props: dict[str, object]) -> None:
+            received.append((sn, props))
+            got_message.set()
+
+        with patch("socketry.client.aiomqtt.Client", return_value=mock_cm):
+            client = Client({**MOCK_CREDS})
+            sub = await client.subscribe(callback)
+            assert isinstance(sub, Subscription)
+            await asyncio.wait_for(got_message.wait(), timeout=2)
+            await sub.stop()
+
+        assert received == [("SN001", {"oac": 1})]
