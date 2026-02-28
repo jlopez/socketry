@@ -50,8 +50,9 @@ def _make_subscribe_mock(
             for sn, props in messages:
                 await callback(sn, props)
 
-        task = asyncio.get_event_loop().create_task(run())
-        return Subscription(task)
+        task = asyncio.create_task(run())
+        dummy_client = Client(MOCK_CREDS)
+        return Subscription(task, dummy_client)
 
     return AsyncMock(side_effect=fake_subscribe)
 

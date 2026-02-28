@@ -1253,6 +1253,9 @@ class TestRunSubscribeLoop:
 
 
 class TestSubscription:
+    def _make_client(self) -> Client:
+        return Client({**MOCK_CREDS})
+
     async def test_stop_cancels_task(self):
         """stop() should cancel the background task and return cleanly."""
 
@@ -1260,7 +1263,7 @@ class TestSubscription:
             await asyncio.Event().wait()
 
         task = asyncio.create_task(block_forever())
-        sub = Subscription(task)
+        sub = Subscription(task, self._make_client())
         await sub.stop()
         assert task.done()
 
@@ -1272,7 +1275,7 @@ class TestSubscription:
 
         task = asyncio.create_task(fail())
         await asyncio.sleep(0)  # let the task fail
-        sub = Subscription(task)
+        sub = Subscription(task, self._make_client())
         await sub.stop()  # should not raise
         assert task.done()
 
@@ -1283,9 +1286,65 @@ class TestSubscription:
             return
 
         task = asyncio.create_task(quick())
-        sub = Subscription(task)
+        sub = Subscription(task, self._make_client())
         await sub.wait()
         assert task.done()
+
+    async def test_is_connected_false_when_no_active_mqtt(self):
+        """is_connected returns False when _active_mqtt is None."""
+
+        async def block_forever() -> None:
+            await asyncio.Event().wait()
+
+        client = self._make_client()
+        assert client._active_mqtt is None
+        task = asyncio.create_task(block_forever())
+        sub = Subscription(task, client)
+        assert sub.is_connected is False
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    async def test_is_connected_true_when_active_mqtt_set(self):
+        """is_connected returns True when _active_mqtt is set to a mock value."""
+
+        async def block_forever() -> None:
+            await asyncio.Event().wait()
+
+        client = self._make_client()
+        task = asyncio.create_task(block_forever())
+        sub = Subscription(task, client)
+
+        mock_mqtt = MagicMock()
+        client._active_mqtt = mock_mqtt
+        assert sub.is_connected is True
+
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    async def test_is_connected_reflects_realtime_changes(self):
+        """is_connected reflects live changes to _active_mqtt."""
+
+        async def block_forever() -> None:
+            await asyncio.Event().wait()
+
+        client = self._make_client()
+        task = asyncio.create_task(block_forever())
+        sub = Subscription(task, client)
+
+        assert sub.is_connected is False
+
+        mock_mqtt = MagicMock()
+        client._active_mqtt = mock_mqtt
+        assert sub.is_connected is True
+
+        client._active_mqtt = None
+        assert sub.is_connected is False
+
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
 
 class TestClientSubscribe:
@@ -1313,6 +1372,38 @@ class TestClientSubscribe:
             await sub.stop()
 
         assert received == [("SN001", {"oac": 1})]
+
+    async def test_is_connected_reflects_subscribe_loop_lifecycle(self):
+        """is_connected is True while _run_subscribe_loop holds the connection open
+        and False after stop() clears _active_mqtt."""
+        update_msg = json.dumps(
+            {
+                "deviceSn": "SN001",
+                "messageType": "DevicePropertyChange",
+                "body": {"oac": 1},
+            }
+        ).encode()
+        mock_cm, _ = _make_mock_mqtt_client([update_msg])
+        connected_during_callback: list[bool] = []
+        got_message = asyncio.Event()
+
+        async def callback(sn: str, props: dict[str, object]) -> None:
+            # Capture is_connected while the loop is still running.
+            connected_during_callback.append(sub.is_connected)
+            got_message.set()
+
+        with patch("socketry.client.aiomqtt.Client", return_value=mock_cm):
+            client = Client({**MOCK_CREDS})
+            sub = await client.subscribe(callback)
+            await asyncio.wait_for(got_message.wait(), timeout=2)
+            # Still connected while the subscription task is alive.
+            assert sub.is_connected is True
+            await sub.stop()
+
+        # After stop(), _active_mqtt is cleared by the finally block.
+        assert sub.is_connected is False
+        # Sanity: callback was called with the connection live.
+        assert connected_during_callback == [True]
 
 
 # ---------------------------------------------------------------------------
