@@ -302,6 +302,20 @@ class TestHttpLogin:
 # ---------------------------------------------------------------------------
 
 
+class TestClientProperties:
+    def test_user_id_present(self):
+        client = Client({"userId": "U42"})
+        assert client.user_id == "U42"
+
+    def test_user_id_missing_returns_empty_string(self):
+        client = Client({})
+        assert client.user_id == ""
+
+    def test_user_id_converts_non_string(self):
+        client = Client({"userId": 12345})
+        assert client.user_id == "12345"
+
+
 class TestClientLogin:
     async def test_returns_client(self):
         login_response = {
