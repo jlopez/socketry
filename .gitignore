@@ -44,3 +44,4 @@ htmlcov/
 # Keep these
 !.env.example
 !.gitignore
+artifacts/

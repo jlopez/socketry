@@ -19,6 +19,7 @@ from socketry._constants import API_BASE, MQTT_HOST, MQTT_PORT
 from socketry.client import (
     Client,
     Device,
+    MqttError,
     Subscription,
     TokenExpiredError,
     _build_command_payload,
@@ -453,6 +454,12 @@ class TestClientDevice:
         client = Client({"token": "tok", "devices": []})
         with pytest.raises(IndexError, match="No cached device list"):
             client.device(0)
+
+    def test_device_sn_empty_cache_raises_key_error(self):
+        """device() with a string SN raises KeyError (not IndexError) when list is empty."""
+        client = Client({"token": "tok", "devices": []})
+        with pytest.raises(KeyError, match="SN-MISSING"):
+            client.device("SN-MISSING")
 
 
 class TestClientFromSaved:
@@ -908,6 +915,69 @@ class TestSetProperty:
         client = Client({**MOCK_CREDS})
         with pytest.raises(ValueError, match="Invalid value"):
             await client.set_property("ac", "maybe")
+
+    async def test_mqtt_error_wrapped_as_socketry_mqtt_error(self):
+        """aiomqtt.MqttError is re-raised as socketry.MqttError."""
+        import aiomqtt as _aiomqtt
+
+        mock_cm = AsyncMock()
+        mock_cm.__aenter__ = AsyncMock(side_effect=_aiomqtt.MqttError("connection refused"))
+        mock_cm.__aexit__ = AsyncMock(return_value=False)
+
+        client = Client({**MOCK_CREDS})
+        with (
+            patch("socketry.client.aiomqtt.Client", return_value=mock_cm),
+            pytest.raises(MqttError, match="connection refused"),
+        ):
+            await client.set_property("ac", "on")
+
+    async def test_mqtt_error_is_connection_error_subclass(self):
+        """socketry.MqttError is a ConnectionError subclass for convenient catching."""
+        import aiomqtt as _aiomqtt
+
+        mock_cm = AsyncMock()
+        mock_cm.__aenter__ = AsyncMock(side_effect=_aiomqtt.MqttError("timeout"))
+        mock_cm.__aexit__ = AsyncMock(return_value=False)
+
+        client = Client({**MOCK_CREDS})
+        with (
+            patch("socketry.client.aiomqtt.Client", return_value=mock_cm),
+            pytest.raises(ConnectionError),
+        ):
+            await client.set_property("ac", "on")
+
+    async def test_mqtt_error_chained_from_aiomqtt(self):
+        """The socketry.MqttError is chained from the original aiomqtt.MqttError."""
+        import aiomqtt as _aiomqtt
+
+        original = _aiomqtt.MqttError("broker unavailable")
+        mock_cm = AsyncMock()
+        mock_cm.__aenter__ = AsyncMock(side_effect=original)
+        mock_cm.__aexit__ = AsyncMock(return_value=False)
+
+        client = Client({**MOCK_CREDS})
+        with patch("socketry.client.aiomqtt.Client", return_value=mock_cm):
+            try:
+                await client.set_property("ac", "on")
+            except MqttError as exc:
+                assert exc.__cause__ is original
+            else:
+                pytest.fail("MqttError not raised")
+
+    async def test_mqtt_error_wrapped_wait_true(self):
+        """aiomqtt.MqttError is wrapped as socketry.MqttError for the wait=True path."""
+        import aiomqtt as _aiomqtt
+
+        mock_cm = AsyncMock()
+        mock_cm.__aenter__ = AsyncMock(side_effect=_aiomqtt.MqttError("connection reset"))
+        mock_cm.__aexit__ = AsyncMock(return_value=False)
+
+        client = Client({**MOCK_CREDS})
+        with (
+            patch("socketry.client.aiomqtt.Client", return_value=mock_cm),
+            pytest.raises(MqttError, match="connection reset"),
+        ):
+            await client.set_property("ac", "on", wait=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1366,6 +1436,41 @@ class TestDevice:
         dev = client.device(0)
         with pytest.raises(ValueError, match="read-only"):
             await dev.set_property("battery", "50")
+
+    async def test_set_property_mqtt_error_wrapped(self):
+        """Device.set_property wraps aiomqtt.MqttError as socketry.MqttError."""
+        import aiomqtt as _aiomqtt
+
+        mock_cm = AsyncMock()
+        mock_cm.__aenter__ = AsyncMock(side_effect=_aiomqtt.MqttError("broker gone"))
+        mock_cm.__aexit__ = AsyncMock(return_value=False)
+
+        client = self._client()
+        dev = client.device(0)
+        with (
+            patch("socketry.client.aiomqtt.Client", return_value=mock_cm),
+            pytest.raises(MqttError, match="broker gone"),
+        ):
+            await dev.set_property("ac", "on")
+
+    async def test_set_property_mqtt_error_chained(self):
+        """Device.set_property chains the original aiomqtt.MqttError as __cause__."""
+        import aiomqtt as _aiomqtt
+
+        original = _aiomqtt.MqttError("tls handshake failed")
+        mock_cm = AsyncMock()
+        mock_cm.__aenter__ = AsyncMock(side_effect=original)
+        mock_cm.__aexit__ = AsyncMock(return_value=False)
+
+        client = self._client()
+        dev = client.device(0)
+        with patch("socketry.client.aiomqtt.Client", return_value=mock_cm):
+            try:
+                await dev.set_property("ac", "on")
+            except MqttError as exc:
+                assert exc.__cause__ is original
+            else:
+                pytest.fail("MqttError not raised")
 
 
 # ---------------------------------------------------------------------------
