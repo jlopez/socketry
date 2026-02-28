@@ -463,7 +463,7 @@ class Client:
         method cancels the background listener.
         """
         task = asyncio.create_task(self._run_subscribe_loop(callback, on_disconnect=on_disconnect))
-        return Subscription(task)
+        return Subscription(task, self)
 
     # ------------------------------------------------------------------
     # Control (MQTT)
@@ -672,8 +672,14 @@ class Subscription:
     subscription ends (e.g. via cancellation or error).
     """
 
-    def __init__(self, task: asyncio.Task[None]) -> None:
+    def __init__(self, task: asyncio.Task[None], client: Client) -> None:
         self._task = task
+        self._client = client
+
+    @property
+    def is_connected(self) -> bool:
+        """True when the MQTT broker connection is currently established."""
+        return self._client._active_mqtt is not None
 
     async def stop(self) -> None:
         """Cancel the subscription and wait for cleanup."""
