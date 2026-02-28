@@ -59,6 +59,15 @@ class TokenExpiredError(RuntimeError):
     """Raised when the Jackery API returns error code 10402 (token expired)."""
 
 
+class MqttError(ConnectionError):
+    """Raised when an MQTT operation fails.
+
+    Wraps :class:`aiomqtt.MqttError` so callers do not need to import
+    ``aiomqtt`` to catch MQTT-related failures from :meth:`Client.set_property`
+    or :meth:`Device.set_property`.
+    """
+
+
 class Device:
     """A specific Jackery device.
 
@@ -168,22 +177,25 @@ class Device:
         body: dict[str, object] = {setting.prop_key: int_value}
         assert setting.action_id is not None
 
-        if wait:
-            result = await self._client._publish_and_wait(
-                self._sn,
-                setting.action_id,
-                body,
-                expected_keys=set(body.keys()),
-                verbose=verbose,
-            )
-            if result is not None:
-                resp = result.get("body")
-                if isinstance(resp, dict):
-                    return resp
-            return None
-        else:
-            await self._client._publish_command(self._sn, setting.action_id, body)
-            return None
+        try:
+            if wait:
+                result = await self._client._publish_and_wait(
+                    self._sn,
+                    setting.action_id,
+                    body,
+                    expected_keys=set(body.keys()),
+                    verbose=verbose,
+                )
+                if result is not None:
+                    resp = result.get("body")
+                    if isinstance(resp, dict):
+                        return resp
+                return None
+            else:
+                await self._client._publish_command(self._sn, setting.action_id, body)
+                return None
+        except aiomqtt.MqttError as e:
+            raise MqttError(str(e)) from e
 
 
 class Client:
@@ -363,11 +375,17 @@ class Client:
 
         Raises:
             IndexError: If an integer index is out of range, or no
-                devices are cached.
-            KeyError: If a serial-number string is not found.
+                devices are cached (integer lookup only).
+            KeyError: If a serial-number string is not found, or no
+                devices are cached (string lookup only).
         """
         devs = self.devices
         if not devs:
+            if isinstance(index_or_sn, str):
+                raise KeyError(
+                    f"No device with SN '{index_or_sn}': device list is empty. "
+                    "Call fetch_devices() first."
+                )
             raise IndexError("No cached device list. Call fetch_devices() first.")
         if isinstance(index_or_sn, int):
             if index_or_sn < 0 or index_or_sn >= len(devs):
@@ -485,22 +503,25 @@ class Client:
         body: dict[str, object] = {setting.prop_key: int_value}
         assert setting.action_id is not None
 
-        if wait:
-            result = await self._publish_and_wait(
-                self.device_sn,
-                setting.action_id,
-                body,
-                expected_keys=set(body.keys()),
-                verbose=verbose,
-            )
-            if result is not None:
-                resp = result.get("body")
-                if isinstance(resp, dict):
-                    return resp
-            return None
-        else:
-            await self._publish_command(self.device_sn, setting.action_id, body)
-            return None
+        try:
+            if wait:
+                result = await self._publish_and_wait(
+                    self.device_sn,
+                    setting.action_id,
+                    body,
+                    expected_keys=set(body.keys()),
+                    verbose=verbose,
+                )
+                if result is not None:
+                    resp = result.get("body")
+                    if isinstance(resp, dict):
+                        return resp
+                return None
+            else:
+                await self._publish_command(self.device_sn, setting.action_id, body)
+                return None
+        except aiomqtt.MqttError as e:
+            raise MqttError(str(e)) from e
 
     # ------------------------------------------------------------------
     # Private MQTT methods
