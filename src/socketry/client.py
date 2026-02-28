@@ -59,6 +59,24 @@ class TokenExpiredError(RuntimeError):
     """Raised when the Jackery API returns error code 10402 (token expired)."""
 
 
+class AuthenticationError(Exception):
+    """Raised when login fails after an automatic re-authentication attempt.
+
+    Triggered when the Jackery API returns an auth error (session invalidated
+    by the server) and the automatic re-login attempt also fails (e.g. bad
+    credentials, account suspended).
+    """
+
+
+class _SessionInvalidatedError(RuntimeError):
+    """Internal sentinel: API returned a non-token-expiry auth/API error.
+
+    Raised by HTTP helpers to signal that the current session is rejected by
+    the server.  :meth:`Client._relogin` catches this, attempts one re-login,
+    and re-raises as :class:`AuthenticationError` on failure.
+    """
+
+
 class MqttError(ConnectionError):
     """Raised when an MQTT operation fails.
 
@@ -124,6 +142,9 @@ class Device:
             except TokenExpiredError:
                 self._client._creds["tokenExp"] = 0
                 await self._client._ensure_fresh_token()
+                return await _fetch_device_properties(self._client.token, self._id, session)
+            except _SessionInvalidatedError:
+                await self._client._relogin()
                 return await _fetch_device_properties(self._client.token, self._id, session)
 
     async def get_property(self, name: str) -> tuple[Setting, object]:
@@ -330,6 +351,28 @@ class Client:
             if self._auto_save:
                 self.save_credentials()
 
+    async def _relogin(self) -> None:
+        """Re-authenticate using stored credentials and update the session.
+
+        Called automatically when the server rejects the current session
+        (:class:`_SessionInvalidatedError`).  Raises :class:`AuthenticationError`
+        if the re-login attempt fails (wrong password, account suspended, etc.).
+
+        Only the auth fields (``token``, ``mqttPassWord``, ``tokenExp``) are
+        updated so that device selection is preserved.
+        """
+        email = str(self._creds.get("email", ""))
+        password = str(self._creds.get("password", ""))
+        try:
+            new_creds = await _http_login(email, password, fetch_devices=False)
+        except Exception as exc:
+            raise AuthenticationError(f"Re-authentication failed: {exc}") from exc
+        self._creds["token"] = new_creds["token"]
+        self._creds["mqttPassWord"] = new_creds["mqttPassWord"]
+        self._creds["tokenExp"] = new_creds.get("tokenExp")
+        if self._auto_save:
+            self.save_credentials()
+
     # ------------------------------------------------------------------
     # Device management
     # ------------------------------------------------------------------
@@ -346,6 +389,9 @@ class Client:
             except TokenExpiredError:
                 self._creds["tokenExp"] = 0
                 await self._ensure_fresh_token()
+                all_devices = await _fetch_all_devices(self.token, session)
+            except _SessionInvalidatedError:
+                await self._relogin()
                 all_devices = await _fetch_all_devices(self.token, session)
         self._creds["devices"] = all_devices
         return all_devices
@@ -415,6 +461,9 @@ class Client:
             except TokenExpiredError:
                 self._creds["tokenExp"] = 0
                 await self._ensure_fresh_token()
+                return await _fetch_device_properties(self.token, self.device_id, session)
+            except _SessionInvalidatedError:
+                await self._relogin()
                 return await _fetch_device_properties(self.token, self.device_id, session)
 
     async def get_property(self, name: str) -> tuple[Setting, object]:
@@ -828,6 +877,9 @@ async def _fetch_all_devices(token: str, session: aiohttp.ClientSession) -> list
         dev_body = await dev_resp.json()
     if dev_body.get("code") == 10402:
         raise TokenExpiredError("Token expired (10402)")
+    if dev_body.get("code") != 0:
+        msg = dev_body.get("msg", "unknown error")
+        raise _SessionInvalidatedError(f"Device list fetch failed: {msg}")
     for d in dev_body.get("data") or []:
         all_devices.append(
             {
@@ -895,7 +947,7 @@ async def _fetch_device_properties(
         raise TokenExpiredError("Token expired (10402)")
     if body.get("code") != 0:
         msg = body.get("msg", "unknown error")
-        raise RuntimeError(f"Property fetch failed: {msg}")
+        raise _SessionInvalidatedError(f"Property fetch failed: {msg}")
     return body.get("data") or {}
 
 

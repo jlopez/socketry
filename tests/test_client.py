@@ -17,6 +17,7 @@ from aioresponses import aioresponses
 
 from socketry._constants import API_BASE, MQTT_HOST, MQTT_PORT
 from socketry.client import (
+    AuthenticationError,
     Client,
     Device,
     MqttError,
@@ -31,6 +32,7 @@ from socketry.client import (
     _mqtt_params,
     _parse_device_update,
     _resolve_value,
+    _SessionInvalidatedError,
 )
 from socketry.properties import Setting
 
@@ -123,7 +125,7 @@ def _mock_device_endpoints(
     share_list: list[dict[str, Any]] | None = None,
 ) -> None:
     """Register mock responses for device list endpoints."""
-    m.get(f"{API_BASE}/device/bind/list", payload={"data": owned or []})
+    m.get(f"{API_BASE}/device/bind/list", payload={"code": 0, "data": owned or []})
     m.get(f"{API_BASE}/device/bind/shared", payload={"data": shared_data or {}})
     if share_list is not None:
         m.post(f"{API_BASE}/device/bind/share/list", payload={"data": share_list})
@@ -1830,7 +1832,7 @@ class TestReactiveTokenRefresh:
             # First call returns 10402
             m.get(f"{API_BASE}/device/bind/list", payload={"code": 10402})
             # Second call (after re-auth) succeeds
-            m.get(f"{API_BASE}/device/bind/list", payload={"data": [MOCK_OWNED_DEVICE]})
+            m.get(f"{API_BASE}/device/bind/list", payload={"code": 0, "data": [MOCK_OWNED_DEVICE]})
             m.get(f"{API_BASE}/device/bind/shared", payload={"data": {}})
 
             with patch("socketry.client._http_login", return_value=new_token_creds):
@@ -1876,3 +1878,260 @@ class TestReactiveTokenRefresh:
 
         assert result["properties"]["rb"] == 77  # type: ignore[index]
         assert client.token == "new-tok"
+
+
+# ---------------------------------------------------------------------------
+# AuthenticationError / session self-heal tests
+# ---------------------------------------------------------------------------
+
+
+class TestSessionInvalidatedError:
+    """_SessionInvalidatedError is raised by API helpers for non-zero, non-10402 codes."""
+
+    async def test_fetch_device_properties_raises_session_invalidated(self):
+        with aioresponses() as m:
+            m.get(_PROPERTY_URL, payload={"code": 10403, "msg": "Session invalidated"})
+            async with aiohttp.ClientSession() as session:
+                with pytest.raises(_SessionInvalidatedError, match="Property fetch failed"):
+                    await _fetch_device_properties("stale-token", "DEV001", session)
+
+    async def test_fetch_device_properties_session_invalidated_is_runtime_error(self):
+        """_SessionInvalidatedError is a RuntimeError subclass (backwards compat)."""
+        with aioresponses() as m:
+            m.get(_PROPERTY_URL, payload={"code": 10600, "msg": "Auth failed"})
+            async with aiohttp.ClientSession() as session:
+                with pytest.raises(RuntimeError):
+                    await _fetch_device_properties("stale-token", "DEV001", session)
+
+    async def test_fetch_all_devices_raises_session_invalidated(self):
+        with aioresponses() as m:
+            m.get(
+                f"{API_BASE}/device/bind/list",
+                payload={"code": 10403, "msg": "Unauthorized"},
+            )
+            async with aiohttp.ClientSession() as session:
+                with pytest.raises(_SessionInvalidatedError, match="Device list fetch failed"):
+                    await _fetch_all_devices("stale-token", session)
+
+
+class TestAuthSelfHeal:
+    """Client auto-retries API calls on session invalidation.
+
+    On re-login failure, AuthenticationError is raised.
+    """
+
+    def _creds_with_password(self) -> dict[str, Any]:
+        return {
+            **MOCK_CREDS,
+            "email": "me@example.com",
+            "password": "secret",
+            "tokenExp": time.time() + 86400 * 30,
+        }
+
+    def _new_token_creds(self) -> dict[str, Any]:
+        return {"token": "refreshed-tok", "mqttPassWord": "new-pw", "tokenExp": None}
+
+    # ---- get_all_properties (Client) ----
+
+    async def test_get_all_properties_retries_on_session_invalidated(self):
+        """Auth error → re-login → retry → caller sees clean result."""
+        client = Client({**self._creds_with_password(), "deviceId": "DEV001"})
+        mock_data: dict[str, Any] = {"properties": {"rb": 80}}
+
+        with aioresponses() as m:
+            m.get(_PROPERTY_URL, payload={"code": 10403, "msg": "Unauthorized"})
+            m.get(_PROPERTY_URL, payload={"code": 0, "data": mock_data})
+
+            with patch("socketry.client._http_login", return_value=self._new_token_creds()):
+                result = await client.get_all_properties()
+
+        assert result["properties"]["rb"] == 80  # type: ignore[index]
+        assert client.token == "refreshed-tok"
+
+    async def test_get_all_properties_raises_authentication_error_on_failed_relogin(self):
+        """Auth error + re-login failure → AuthenticationError raised."""
+        client = Client({**self._creds_with_password(), "deviceId": "DEV001"})
+
+        with aioresponses() as m:
+            m.get(_PROPERTY_URL, payload={"code": 10403, "msg": "Unauthorized"})
+
+            with (
+                patch(
+                    "socketry.client._http_login",
+                    side_effect=RuntimeError("Login failed: bad credentials"),
+                ),
+                pytest.raises(AuthenticationError, match="Re-authentication failed"),
+            ):
+                await client.get_all_properties()
+
+    async def test_get_all_properties_retries_exactly_once(self):
+        """Auth error triggers exactly one re-login attempt (not multiple)."""
+        client = Client({**self._creds_with_password(), "deviceId": "DEV001"})
+        login_call_count = 0
+
+        async def counting_login(*args: object, **kwargs: object) -> dict[str, Any]:
+            nonlocal login_call_count
+            login_call_count += 1
+            raise RuntimeError("Login failed")
+
+        with aioresponses() as m:
+            m.get(_PROPERTY_URL, payload={"code": 10403, "msg": "Unauthorized"})
+
+            with (
+                patch("socketry.client._http_login", side_effect=counting_login),
+                pytest.raises(AuthenticationError),
+            ):
+                await client.get_all_properties()
+
+        assert login_call_count == 1
+
+    # ---- fetch_devices (Client) ----
+
+    async def test_fetch_devices_retries_on_session_invalidated(self):
+        """Session invalidation on fetch_devices → re-login → retry transparently."""
+        client = Client(self._creds_with_password())
+
+        with aioresponses() as m:
+            m.get(f"{API_BASE}/device/bind/list", payload={"code": 10403, "msg": "Unauthorized"})
+            m.get(f"{API_BASE}/device/bind/list", payload={"code": 0, "data": [MOCK_OWNED_DEVICE]})
+            m.get(f"{API_BASE}/device/bind/shared", payload={"data": {}})
+
+            with patch("socketry.client._http_login", return_value=self._new_token_creds()):
+                devices = await client.fetch_devices()
+
+        assert len(devices) == 1
+        assert client.token == "refreshed-tok"
+
+    async def test_fetch_devices_raises_authentication_error_on_failed_relogin(self):
+        """Session invalidation + re-login failure → AuthenticationError."""
+        client = Client(self._creds_with_password())
+
+        with aioresponses() as m:
+            m.get(f"{API_BASE}/device/bind/list", payload={"code": 10403, "msg": "Unauthorized"})
+
+            with (
+                patch(
+                    "socketry.client._http_login",
+                    side_effect=RuntimeError("Login failed: bad credentials"),
+                ),
+                pytest.raises(AuthenticationError, match="Re-authentication failed"),
+            ):
+                await client.fetch_devices()
+
+    # ---- Device.get_all_properties ----
+
+    async def test_device_get_all_properties_retries_on_session_invalidated(self):
+        """Device.get_all_properties: session invalidation → re-login → retry."""
+        client = Client(
+            {
+                **self._creds_with_password(),
+                "devices": [
+                    {"devSn": "SN001", "devId": "DEV001", "devName": "Station", "modelCode": 2}
+                ],
+            }
+        )
+        dev = client.device(0)
+        mock_data: dict[str, Any] = {"properties": {"rb": 90}}
+
+        with aioresponses() as m:
+            m.get(_PROPERTY_URL, payload={"code": 10403, "msg": "Unauthorized"})
+            m.get(_PROPERTY_URL, payload={"code": 0, "data": mock_data})
+
+            with patch("socketry.client._http_login", return_value=self._new_token_creds()):
+                result = await dev.get_all_properties()
+
+        assert result["properties"]["rb"] == 90  # type: ignore[index]
+        assert client.token == "refreshed-tok"
+
+    async def test_device_get_all_properties_raises_on_failed_relogin(self):
+        """Device.get_all_properties: session invalidated, re-login fails → AuthenticationError."""
+        client = Client(
+            {
+                **self._creds_with_password(),
+                "devices": [
+                    {"devSn": "SN001", "devId": "DEV001", "devName": "Station", "modelCode": 2}
+                ],
+            }
+        )
+        dev = client.device(0)
+
+        with aioresponses() as m:
+            m.get(_PROPERTY_URL, payload={"code": 10403, "msg": "Unauthorized"})
+
+            with (
+                patch(
+                    "socketry.client._http_login",
+                    side_effect=RuntimeError("Login failed: bad credentials"),
+                ),
+                pytest.raises(AuthenticationError),
+            ):
+                await dev.get_all_properties()
+
+    # ---- Auto-save on re-login ----
+
+    async def test_relogin_persists_credentials_for_auto_save_client(self, tmp_path, monkeypatch):
+        """from_saved() clients persist refreshed credentials after re-login."""
+        cred_dir = tmp_path / "config"
+        cred_file = cred_dir / "credentials.json"
+        cred_dir.mkdir()
+        creds = {**self._creds_with_password(), "deviceId": "DEV001"}
+        cred_file.write_text(json.dumps(creds))
+        cred_file.chmod(0o600)
+        monkeypatch.setattr("socketry.client.CRED_DIR", cred_dir)
+        monkeypatch.setattr("socketry.client.CRED_FILE", cred_file)
+
+        mock_data: dict[str, Any] = {"properties": {"rb": 55}}
+        client = Client.from_saved()
+
+        with aioresponses() as m:
+            m.get(_PROPERTY_URL, payload={"code": 10403, "msg": "Unauthorized"})
+            m.get(_PROPERTY_URL, payload={"code": 0, "data": mock_data})
+
+            with patch("socketry.client._http_login", return_value=self._new_token_creds()):
+                await client.get_all_properties()
+
+        saved = json.loads(cred_file.read_text())
+        assert saved["token"] == "refreshed-tok"
+
+    async def test_relogin_does_not_persist_for_non_auto_save_client(self, tmp_path, monkeypatch):
+        """Programmatically constructed clients do NOT auto-save after re-login."""
+        cred_dir = tmp_path / "config"
+        cred_file = cred_dir / "credentials.json"
+        cred_dir.mkdir()
+        original_creds = {**self._creds_with_password(), "deviceId": "DEV001"}
+        original_json = json.dumps(original_creds)
+        cred_file.write_text(original_json)
+        cred_file.chmod(0o600)
+        monkeypatch.setattr("socketry.client.CRED_DIR", cred_dir)
+        monkeypatch.setattr("socketry.client.CRED_FILE", cred_file)
+
+        mock_data: dict[str, Any] = {"properties": {"rb": 55}}
+        # Constructed directly, not from_saved()
+        client = Client(original_creds)
+
+        with aioresponses() as m:
+            m.get(_PROPERTY_URL, payload={"code": 10403, "msg": "Unauthorized"})
+            m.get(_PROPERTY_URL, payload={"code": 0, "data": mock_data})
+
+            with patch("socketry.client._http_login", return_value=self._new_token_creds()):
+                await client.get_all_properties()
+
+        # File should remain unchanged
+        assert cred_file.read_text() == original_json
+
+
+class TestAuthenticationErrorExported:
+    """AuthenticationError is exported from the top-level socketry package."""
+
+    def test_authentication_error_importable(self):
+        import socketry
+
+        assert hasattr(socketry, "AuthenticationError")
+        assert socketry.AuthenticationError is AuthenticationError
+
+    def test_authentication_error_is_exception_subclass(self):
+        assert issubclass(AuthenticationError, Exception)
+
+    def test_authentication_error_not_runtime_error(self):
+        """AuthenticationError is NOT a RuntimeError — it's a distinct exception type."""
+        assert not issubclass(AuthenticationError, RuntimeError)
