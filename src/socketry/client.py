@@ -273,6 +273,11 @@ class Client:
         """Current JWT auth token."""
         return str(self._creds.get("token", ""))
 
+    @property
+    def user_id(self) -> str:
+        """Authenticated user ID."""
+        return str(self._creds.get("userId", ""))
+
     # ------------------------------------------------------------------
     # Token refresh
     # ------------------------------------------------------------------
