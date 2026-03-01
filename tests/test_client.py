@@ -2119,6 +2119,63 @@ class TestAuthSelfHeal:
         # File should remain unchanged
         assert cred_file.read_text() == original_json
 
+    async def test_relogin_raises_immediately_when_credentials_absent(self):
+        """_relogin raises AuthenticationError immediately (no network call) when creds absent."""
+        client = Client({"token": "stale-tok", "deviceId": "DEV001"})
+
+        with (
+            patch("socketry.client._http_login") as mock_login,
+            pytest.raises(AuthenticationError, match="Cannot re-authenticate"),
+        ):
+            await client._relogin("stale-tok")
+
+        mock_login.assert_not_called()
+
+    async def test_session_invalidated_with_no_creds_raises_authentication_error(self):
+        """Session invalidation on a client without stored creds raises AuthenticationError."""
+        client = Client({"token": "stale-tok", "deviceId": "DEV001"})
+
+        with aioresponses() as m:
+            m.get(_PROPERTY_URL, payload={"code": 10403, "msg": "Unauthorized"})
+
+            with (
+                patch("socketry.client._http_login") as mock_login,
+                pytest.raises(AuthenticationError, match="Cannot re-authenticate"),
+            ):
+                await client.get_all_properties()
+
+        mock_login.assert_not_called()
+
+    async def test_concurrent_session_invalidated_triggers_single_relogin(self):
+        """Two concurrent auth failures cause only one re-login attempt."""
+        client = Client({**self._creds_with_password(), "deviceId": "DEV001"})
+        login_call_count = 0
+
+        async def counting_login(*args: object, **kwargs: object) -> dict[str, Any]:
+            nonlocal login_call_count
+            login_call_count += 1
+            await asyncio.sleep(0.05)  # simulate network latency
+            return self._new_token_creds()
+
+        mock_data: dict[str, Any] = {"properties": {"rb": 42}}
+
+        with aioresponses() as m:
+            # Both concurrent calls get auth errors first
+            m.get(_PROPERTY_URL, payload={"code": 10403, "msg": "Unauthorized"})
+            m.get(_PROPERTY_URL, payload={"code": 10403, "msg": "Unauthorized"})
+            # Both retries succeed
+            m.get(_PROPERTY_URL, payload={"code": 0, "data": mock_data})
+            m.get(_PROPERTY_URL, payload={"code": 0, "data": mock_data})
+
+            with patch("socketry.client._http_login", side_effect=counting_login):
+                results = await asyncio.gather(
+                    client.get_all_properties(),
+                    client.get_all_properties(),
+                )
+
+        assert login_call_count == 1, f"Expected 1 re-login, got {login_call_count}"
+        assert all(r["properties"]["rb"] == 42 for r in results)  # type: ignore[index]
+
 
 class TestAuthenticationErrorExported:
     """AuthenticationError is exported from the top-level socketry package."""

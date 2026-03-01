@@ -144,7 +144,8 @@ class Device:
                 await self._client._ensure_fresh_token()
                 return await _fetch_device_properties(self._client.token, self._id, session)
             except _SessionInvalidatedError:
-                await self._client._relogin()
+                stale = self._client.token
+                await self._client._relogin(stale)
                 return await _fetch_device_properties(self._client.token, self._id, session)
 
     async def get_property(self, name: str) -> tuple[Setting, object]:
@@ -351,27 +352,45 @@ class Client:
             if self._auto_save:
                 self.save_credentials()
 
-    async def _relogin(self) -> None:
+    async def _relogin(self, stale_token: str) -> None:
         """Re-authenticate using stored credentials and update the session.
 
         Called automatically when the server rejects the current session
         (:class:`_SessionInvalidatedError`).  Raises :class:`AuthenticationError`
-        if the re-login attempt fails (wrong password, account suspended, etc.).
+        if the re-login attempt fails (wrong password, account suspended, etc.)
+        or if no credentials are stored.
+
+        *stale_token* is the token that was rejected.  If another concurrent
+        call has already refreshed the token by the time this call acquires
+        :attr:`_refresh_lock`, the re-login is skipped (the session is already
+        healed).
 
         Only the auth fields (``token``, ``mqttPassWord``, ``tokenExp``) are
         updated so that device selection is preserved.
         """
         email = str(self._creds.get("email", ""))
         password = str(self._creds.get("password", ""))
-        try:
-            new_creds = await _http_login(email, password, fetch_devices=False)
-        except Exception as exc:
-            raise AuthenticationError(f"Re-authentication failed: {exc}") from exc
-        self._creds["token"] = new_creds["token"]
-        self._creds["mqttPassWord"] = new_creds["mqttPassWord"]
-        self._creds["tokenExp"] = new_creds.get("tokenExp")
-        if self._auto_save:
-            self.save_credentials()
+        if not email or not password:
+            raise AuthenticationError(
+                "Cannot re-authenticate: no email or password stored in credentials."
+            )
+
+        async with self._refresh_lock:
+            # Another concurrent task may have already refreshed the session
+            # while we were waiting for the lock.  If the token has changed,
+            # the session is healed — skip the re-login.
+            if self.token != stale_token:
+                return
+
+            try:
+                new_creds = await _http_login(email, password, fetch_devices=False)
+            except Exception as exc:
+                raise AuthenticationError(f"Re-authentication failed: {exc}") from exc
+            self._creds["token"] = new_creds["token"]
+            self._creds["mqttPassWord"] = new_creds["mqttPassWord"]
+            self._creds["tokenExp"] = new_creds.get("tokenExp")
+            if self._auto_save:
+                self.save_credentials()
 
     # ------------------------------------------------------------------
     # Device management
@@ -391,7 +410,8 @@ class Client:
                 await self._ensure_fresh_token()
                 all_devices = await _fetch_all_devices(self.token, session)
             except _SessionInvalidatedError:
-                await self._relogin()
+                stale = self.token
+                await self._relogin(stale)
                 all_devices = await _fetch_all_devices(self.token, session)
         self._creds["devices"] = all_devices
         return all_devices
@@ -463,7 +483,8 @@ class Client:
                 await self._ensure_fresh_token()
                 return await _fetch_device_properties(self.token, self.device_id, session)
             except _SessionInvalidatedError:
-                await self._relogin()
+                stale = self.token
+                await self._relogin(stale)
                 return await _fetch_device_properties(self.token, self.device_id, session)
 
     async def get_property(self, name: str) -> tuple[Setting, object]:
