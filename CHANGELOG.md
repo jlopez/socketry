@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.2.1](https://github.com/jlopez/socketry/compare/socketry-v0.2.0...socketry-v0.2.1) (2026-03-01)
+
+
+### Features
+
+* **client:** add is_connected property to Subscription ([#27](https://github.com/jlopez/socketry/issues/27)) ([30d58bf](https://github.com/jlopez/socketry/commit/30d58bfcadac2e1fb8c2f299ad99de2dd9ccfdaa)), closes [#22](https://github.com/jlopez/socketry/issues/22)
+* **client:** expose public user_id property ([#24](https://github.com/jlopez/socketry/issues/24)) ([9a7ef84](https://github.com/jlopez/socketry/commit/9a7ef846f7344133d08829be7ea6b12cd16679bd)), closes [#20](https://github.com/jlopez/socketry/issues/20)
+* **client:** wrap MqttError; use KeyError consistently in device() SN lookup ([#26](https://github.com/jlopez/socketry/issues/26)) ([0963f6b](https://github.com/jlopez/socketry/commit/0963f6b9bfe516f2dc4115779cb631e513387f36)), closes [#21](https://github.com/jlopez/socketry/issues/21)
+
 ## [0.2.0](https://github.com/jlopez/socketry/compare/socketry-v0.1.1...socketry-v0.2.0) (2026-02-27)
 
 
