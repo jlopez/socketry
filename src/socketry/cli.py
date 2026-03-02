@@ -8,7 +8,10 @@ import json
 import sys
 from datetime import datetime
 
-import typer
+try:
+    import typer
+except ImportError:
+    raise SystemExit("socketry CLI requires the 'cli' extra: pip install socketry[cli]") from None
 
 from socketry.client import Client
 from socketry.properties import GROUP_TITLES, MODEL_NAMES, PROPERTIES, Setting, resolve

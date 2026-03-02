@@ -1073,6 +1073,10 @@ dependencies = [
     { name = "aiohttp" },
     { name = "aiomqtt" },
     { name = "pycryptodome" },
+]
+
+[package.optional-dependencies]
+cli = [
     { name = "typer" },
 ]
 
@@ -1085,6 +1089,7 @@ dev = [
     { name = "pytest-asyncio" },
     { name = "pytest-cov" },
     { name = "ruff" },
+    { name = "socketry", extra = ["cli"] },
 ]
 
 [package.metadata]
@@ -1092,8 +1097,9 @@ requires-dist = [
     { name = "aiohttp", specifier = ">=3.9" },
     { name = "aiomqtt", specifier = ">=2.0" },
     { name = "pycryptodome", specifier = ">=3.19" },
-    { name = "typer", specifier = ">=0.9" },
+    { name = "typer", marker = "extra == 'cli'", specifier = ">=0.9" },
 ]
+provides-extras = ["cli"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -1104,6 +1110,7 @@ dev = [
     { name = "pytest-asyncio", specifier = ">=0.26" },
     { name = "pytest-cov", specifier = ">=6.0.0" },
     { name = "ruff", specifier = ">=0.14.14" },
+    { name = "socketry", extras = ["cli"] },
 ]
 
 [[package]]
