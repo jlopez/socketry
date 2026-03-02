@@ -55,11 +55,15 @@ from socketry.properties import Setting, resolve
 _TOKEN_EXPIRY_BUFFER = 3600  # seconds before expiry to trigger proactive refresh
 
 
-class TokenExpiredError(RuntimeError):
+class SocketryError(Exception):
+    """Base exception for all socketry errors."""
+
+
+class TokenExpiredError(SocketryError):
     """Raised when the Jackery API returns error code 10402 (token expired)."""
 
 
-class AuthenticationError(Exception):
+class AuthenticationError(SocketryError):
     """Raised when login fails after an automatic re-authentication attempt.
 
     Triggered when the Jackery API returns an auth error (session invalidated
@@ -68,7 +72,7 @@ class AuthenticationError(Exception):
     """
 
 
-class _SessionInvalidatedError(RuntimeError):
+class _SessionInvalidatedError(SocketryError):
     """Internal sentinel: API returned a non-token-expiry auth/API error.
 
     Raised by HTTP helpers to signal that the current session is rejected by
@@ -77,7 +81,7 @@ class _SessionInvalidatedError(RuntimeError):
     """
 
 
-class MqttError(ConnectionError):
+class MqttError(SocketryError, ConnectionError):
     """Raised when an MQTT operation fails.
 
     Wraps :class:`aiomqtt.MqttError` so callers do not need to import

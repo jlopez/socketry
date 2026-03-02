@@ -21,6 +21,7 @@ from socketry.client import (
     Client,
     Device,
     MqttError,
+    SocketryError,
     Subscription,
     TokenExpiredError,
     _build_command_payload,
@@ -231,7 +232,7 @@ class TestFetchDeviceProperties:
         with aioresponses() as m:
             m.get(_PROPERTY_URL, payload={"code": 10600, "msg": "Auth failed"})
             async with aiohttp.ClientSession() as session:
-                with pytest.raises(RuntimeError, match="Property fetch failed"):
+                with pytest.raises(_SessionInvalidatedError, match="Property fetch failed"):
                     await _fetch_device_properties("fake-token", "DEV001", session)
 
     async def test_http_error(self):
@@ -1895,12 +1896,12 @@ class TestSessionInvalidatedError:
                 with pytest.raises(_SessionInvalidatedError, match="Property fetch failed"):
                     await _fetch_device_properties("stale-token", "DEV001", session)
 
-    async def test_fetch_device_properties_session_invalidated_is_runtime_error(self):
-        """_SessionInvalidatedError is a RuntimeError subclass (backwards compat)."""
+    async def test_fetch_device_properties_session_invalidated_is_socketry_error(self):
+        """_SessionInvalidatedError is a SocketryError subclass."""
         with aioresponses() as m:
             m.get(_PROPERTY_URL, payload={"code": 10600, "msg": "Auth failed"})
             async with aiohttp.ClientSession() as session:
-                with pytest.raises(RuntimeError):
+                with pytest.raises(SocketryError):
                     await _fetch_device_properties("stale-token", "DEV001", session)
 
     async def test_fetch_all_devices_raises_session_invalidated(self):
@@ -2192,3 +2193,35 @@ class TestAuthenticationErrorExported:
     def test_authentication_error_not_runtime_error(self):
         """AuthenticationError is NOT a RuntimeError — it's a distinct exception type."""
         assert not issubclass(AuthenticationError, RuntimeError)
+
+    def test_authentication_error_is_socketry_error(self):
+        assert issubclass(AuthenticationError, SocketryError)
+
+
+class TestSocketryErrorExported:
+    """SocketryError is exported from the top-level socketry package."""
+
+    def test_socketry_error_importable(self):
+        import socketry
+
+        assert hasattr(socketry, "SocketryError")
+        assert socketry.SocketryError is SocketryError
+
+    def test_socketry_error_is_exception_subclass(self):
+        assert issubclass(SocketryError, Exception)
+
+    def test_socketry_error_not_runtime_error(self):
+        assert not issubclass(SocketryError, RuntimeError)
+
+    def test_all_public_errors_are_socketry_errors(self):
+        """Every public exception is a SocketryError subclass."""
+        assert issubclass(AuthenticationError, SocketryError)
+        assert issubclass(MqttError, SocketryError)
+
+    def test_mqtt_error_is_still_connection_error(self):
+        """MqttError retains its ConnectionError base for broad except clauses."""
+        assert issubclass(MqttError, ConnectionError)
+
+    def test_internal_errors_are_socketry_errors(self):
+        assert issubclass(TokenExpiredError, SocketryError)
+        assert issubclass(_SessionInvalidatedError, SocketryError)
