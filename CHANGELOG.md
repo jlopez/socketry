@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.3](https://github.com/jlopez/socketry/compare/socketry-v0.2.2...socketry-v0.2.3) (2026-03-02)
+
+
+### Bug Fixes
+
+* **deps:** make typer an optional dependency ([#40](https://github.com/jlopez/socketry/issues/40)) ([b40e1d5](https://github.com/jlopez/socketry/commit/b40e1d5c404ccd75fe460e419f9f8b2399f1228c)), closes [#39](https://github.com/jlopez/socketry/issues/39)
+
 ## [0.2.2](https://github.com/jlopez/socketry/compare/socketry-v0.2.1...socketry-v0.2.2) (2026-03-02)
 
 
