@@ -290,7 +290,7 @@ class TestHttpLogin:
     async def test_login_failure_code(self):
         with aioresponses() as m:
             m.post(_LOGIN_URL, payload={"code": 1, "msg": "Bad credentials"})
-            with pytest.raises(RuntimeError, match="Login failed: Bad credentials"):
+            with pytest.raises(AuthenticationError, match="Login failed: Bad credentials"):
                 await _http_login("bad@example.com", "wrong")
 
     async def test_login_http_error(self):

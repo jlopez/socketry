@@ -854,7 +854,7 @@ async def _http_login(
 
         if body.get("code") != 0:
             msg = body.get("msg", "unknown error")
-            raise RuntimeError(f"Login failed: {msg}")
+            raise AuthenticationError(f"Login failed: {msg}")
 
         data = body["data"]
         token = body["token"]
