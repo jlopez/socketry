@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.2.2](https://github.com/jlopez/socketry/compare/socketry-v0.2.1...socketry-v0.2.2) (2026-03-02)
+
+
+### Bug Fixes
+
+* **ci:** update uv.lock on release-please PRs ([#38](https://github.com/jlopez/socketry/issues/38)) ([f7cf4ad](https://github.com/jlopez/socketry/commit/f7cf4ade54319abb231c517d994fad8ddf00190f))
+* **client:** introduce SocketryError base class; clean up exception hierarchy ([#36](https://github.com/jlopez/socketry/issues/36)) ([20516ec](https://github.com/jlopez/socketry/commit/20516ec69e180340b71bab572b09f98255310dca)), closes [#33](https://github.com/jlopez/socketry/issues/33)
+* **client:** raise AuthenticationError instead of RuntimeError on login failure ([#34](https://github.com/jlopez/socketry/issues/34)) ([772e552](https://github.com/jlopez/socketry/commit/772e5527b5f8063b6ddb211e8bd9b20e6b2e108c)), closes [#32](https://github.com/jlopez/socketry/issues/32)
+
 ## [0.2.1](https://github.com/jlopez/socketry/compare/socketry-v0.2.0...socketry-v0.2.1) (2026-03-01)
 
 
