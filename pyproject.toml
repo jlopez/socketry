@@ -9,11 +9,13 @@ authors = [
 requires-python = ">=3.11"
 license = "MIT"
 dependencies = [
-    "typer>=0.9",
     "aiomqtt>=2.0",
     "aiohttp>=3.9",
     "pycryptodome>=3.19",
 ]
+
+[project.optional-dependencies]
+cli = ["typer>=0.9"]
 
 [project.scripts]
 socketry = "socketry.cli:app"
@@ -24,6 +26,7 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+    "socketry[cli]",
     "aioresponses>=0.7",
     "mypy>=1.19.1",
     "pre-commit>=4.5.1",

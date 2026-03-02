@@ -13,14 +13,14 @@ the device or its firmware.
 ## Quick start
 
 ```bash
-uvx socketry login --email you@example.com --password 'yourpass'
-uvx socketry get
+uvx 'socketry[cli]' login --email you@example.com --password 'yourpass'
+uvx 'socketry[cli]' get
 ```
 
 Or install it once and use `socketry` directly:
 
 ```bash
-uv tool install socketry
+uv tool install 'socketry[cli]'
 socketry login --email you@example.com --password 'yourpass'
 socketry get
 ```
@@ -49,13 +49,16 @@ properties returned by newer firmware are displayed as raw key/value pairs.
 
 ```bash
 # Install as a CLI tool
-uv tool install socketry
+uv tool install 'socketry[cli]'
 
 # Or run directly without installing
-uvx socketry --help
+uvx 'socketry[cli]' --help
 
-# Or install as a library
+# Or install as a library only (no CLI dependencies)
 pip install socketry
+
+# Or install with CLI included
+pip install 'socketry[cli]'
 ```
 
 ## CLI usage
