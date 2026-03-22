@@ -1,7 +1,7 @@
 # socketry
 
 [![CI](https://github.com/jlopez/socketry/actions/workflows/ci.yml/badge.svg)](https://github.com/jlopez/socketry/actions/workflows/ci.yml)
-![Coverage](https://img.shields.io/badge/coverage-76%25-yellowgreen)
+![Coverage](https://img.shields.io/badge/coverage-77%25-yellowgreen)
 ![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue)
 
 Python API and CLI for controlling Jackery portable power stations.
@@ -155,6 +155,19 @@ Writable settings:
 | `sfc` | on / off | Super fast charge |
 | `ups` | on / off | UPS mode |
 
+### Sharing devices (`share-qr`)
+
+```bash
+# Generate a sharing QR code (expires in 5 minutes)
+socketry share-qr
+
+# JSON output
+socketry share-qr --json
+```
+
+Another Jackery user can scan the QR code in their Jackery app to gain access
+to your shared devices.
+
 ### Watching live updates (`watch`)
 
 ```bash
@@ -205,6 +218,10 @@ async def main():
     # Control
     await client.set_property("ac", "on")
     result = await client.set_property("light", "high", wait=True)
+
+    # Generate a sharing QR code
+    qr = await client.generate_share_qrcode()
+    print(f"QR Code ID: {qr['qrCodeId']}")
 
     # Subscribe to real-time updates
     async def on_update(device_sn: str, properties: dict) -> None:
