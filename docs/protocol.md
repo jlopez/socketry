@@ -128,7 +128,7 @@ You need a two-step lookup:
 | `/device/bind/remove` | POST | `bindUserId`, `devId` | Remove one device from share |
 | `/device/bind/removeAll` | POST | `bindUserId`, `level` | Remove all devices from share |
 | `/device/accept_bind` | POST | | Accept a sharing invitation |
-| `/device/bind/qrcode` | | | QR code for sharing |
+| `/device/bind/qrcode` | GET | `userId` (query) | Generate sharing QR code (valid 5 min) |
 | `/device/bind/nickname` | | | Change device nickname |
 
 **Share relationship response** (`GET /device/bind/shared`):
@@ -156,6 +156,19 @@ You need a two-step lookup:
 
 **Shared device list response** (`POST /device/bind/share/list`):
 Returns array of `{devId, devSn, devModel, devName, devNickname, icon}`.
+
+**Sharing QR code response** (`GET /device/bind/qrcode?userId={userId}`):
+```json
+{
+  "code": 0,
+  "data": {
+    "qrCodeId": "db0c0e9d78f44550992756e643feab95",
+    "userId": 1947774732782673920
+  }
+}
+```
+The QR code content is the JSON-serialized `data` object. Another user scans this in the
+Jackery app to accept the share. The code expires after 5 minutes.
 
 #### Auth Endpoints
 

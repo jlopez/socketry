@@ -467,6 +467,30 @@ class Client:
         raise KeyError(f"No device with SN '{index_or_sn}'.")
 
     # ------------------------------------------------------------------
+    # Sharing
+    # ------------------------------------------------------------------
+
+    async def generate_share_qrcode(self) -> dict[str, object]:
+        """Generate a sharing QR code.
+
+        Returns the ``data`` dict containing ``qrCodeId`` and ``userId``.
+        The QR code is valid for 5 minutes.  Another Jackery user can
+        scan it to gain access to your shared devices.
+        """
+        await self._ensure_fresh_token()
+        async with aiohttp.ClientSession() as session:
+            try:
+                return await _generate_share_qrcode(self.token, self.user_id, session)
+            except TokenExpiredError:
+                self._creds["tokenExp"] = 0
+                await self._ensure_fresh_token()
+                return await _generate_share_qrcode(self.token, self.user_id, session)
+            except _SessionInvalidatedError:
+                stale = self.token
+                await self._relogin(stale)
+                return await _generate_share_qrcode(self.token, self.user_id, session)
+
+    # ------------------------------------------------------------------
     # Status (HTTP)
     # ------------------------------------------------------------------
 
@@ -973,6 +997,31 @@ async def _fetch_device_properties(
     if body.get("code") != 0:
         msg = body.get("msg", "unknown error")
         raise _SessionInvalidatedError(f"Property fetch failed: {msg}")
+    return body.get("data") or {}
+
+
+async def _generate_share_qrcode(
+    token: str, user_id: str, session: aiohttp.ClientSession
+) -> dict[str, object]:
+    """Generate a sharing QR code via HTTP API.
+
+    Returns the ``data`` dict containing ``qrCodeId`` and ``userId``.
+    The QR code is valid for 5 minutes.
+    """
+    auth_headers = {**APP_HEADERS, "token": token}
+    async with session.get(
+        f"{API_BASE}/device/bind/qrcode",
+        params={"userId": user_id},
+        headers=auth_headers,
+        timeout=aiohttp.ClientTimeout(total=15),
+    ) as resp:
+        resp.raise_for_status()
+        body = await resp.json()
+    if body.get("code") == 10402:
+        raise TokenExpiredError("Token expired (10402)")
+    if body.get("code") != 0:
+        msg = body.get("msg", "unknown error")
+        raise _SessionInvalidatedError(f"QR code generation failed: {msg}")
     return body.get("data") or {}
 
 
