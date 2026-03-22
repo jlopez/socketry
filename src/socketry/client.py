@@ -477,6 +477,8 @@ class Client:
         The QR code is valid for 5 minutes.  Another Jackery user can
         scan it to gain access to your shared devices.
         """
+        if not self.user_id:
+            raise ValueError("No userId. Call login() first.")
         await self._ensure_fresh_token()
         async with aiohttp.ClientSession() as session:
             try:

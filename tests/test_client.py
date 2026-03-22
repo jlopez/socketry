@@ -429,6 +429,11 @@ class TestClientGenerateShareQrcode:
 
         assert result["qrCodeId"] == "abc123"
 
+    async def test_raises_without_user_id(self):
+        client = Client({"token": "tok"})
+        with pytest.raises(ValueError, match="No userId"):
+            await client.generate_share_qrcode()
+
 
 class TestClientGetAllProperties:
     async def test_success(self):
