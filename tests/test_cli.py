@@ -195,9 +195,7 @@ class TestShareQrCommand:
     def test_empty_response(self):
         with (
             patch.object(Client, "from_saved", return_value=Client(MOCK_CREDS)),
-            patch.object(
-                Client, "generate_share_qrcode", new_callable=AsyncMock, return_value={}
-            ),
+            patch.object(Client, "generate_share_qrcode", new_callable=AsyncMock, return_value={}),
         ):
             result = runner.invoke(app, ["share-qr"])
 
