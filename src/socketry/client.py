@@ -30,6 +30,7 @@ import secrets
 import ssl
 import time
 from collections.abc import Awaitable, Callable
+from typing import TypedDict
 
 import aiohttp
 import aiomqtt
@@ -53,6 +54,13 @@ from socketry._crypto import (
 from socketry.properties import Setting, resolve
 
 _TOKEN_EXPIRY_BUFFER = 3600  # seconds before expiry to trigger proactive refresh
+
+
+class ShareQrCode(TypedDict):
+    """Response from the sharing QR code endpoint."""
+
+    qrCodeId: str
+    userId: int
 
 
 class SocketryError(Exception):
@@ -470,12 +478,12 @@ class Client:
     # Sharing
     # ------------------------------------------------------------------
 
-    async def generate_share_qrcode(self) -> dict[str, object]:
+    async def generate_share_qrcode(self) -> ShareQrCode:
         """Generate a sharing QR code.
 
-        Returns the ``data`` dict containing ``qrCodeId`` and ``userId``.
-        The QR code is valid for 5 minutes.  Another Jackery user can
-        scan it to gain access to your shared devices.
+        Returns a :class:`ShareQrCode` dict containing ``qrCodeId`` and
+        ``userId``.  The QR code is valid for 5 minutes.  Another Jackery
+        user can scan it to gain access to your shared devices.
         """
         if not self.user_id:
             raise ValueError("No userId. Call login() first.")
@@ -1004,11 +1012,11 @@ async def _fetch_device_properties(
 
 async def _generate_share_qrcode(
     token: str, user_id: str, session: aiohttp.ClientSession
-) -> dict[str, object]:
+) -> ShareQrCode:
     """Generate a sharing QR code via HTTP API.
 
-    Returns the ``data`` dict containing ``qrCodeId`` and ``userId``.
-    The QR code is valid for 5 minutes.
+    Returns a :class:`ShareQrCode` dict containing ``qrCodeId`` and
+    ``userId``.  The QR code is valid for 5 minutes.
     """
     auth_headers = {**APP_HEADERS, "token": token}
     async with session.get(
@@ -1024,7 +1032,8 @@ async def _generate_share_qrcode(
     if body.get("code") != 0:
         msg = body.get("msg", "unknown error")
         raise _SessionInvalidatedError(f"QR code generation failed: {msg}")
-    return body.get("data") or {}
+    data: ShareQrCode = body.get("data") or {}  # type: ignore[assignment]
+    return data
 
 
 # ---------------------------------------------------------------------------

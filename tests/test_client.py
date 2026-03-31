@@ -294,7 +294,7 @@ class TestGenerateShareQrcode:
             async with aiohttp.ClientSession() as session:
                 result = await _generate_share_qrcode("fake-token", "U001", session)
 
-        assert result == {}
+        assert not result
 
 
 class TestHttpLogin:
@@ -409,21 +409,54 @@ class TestClientGenerateShareQrcode:
     async def test_retries_on_token_expired(self):
         # Use a far-future tokenExp so _ensure_fresh_token doesn't try to
         # proactively refresh (which would hit _http_login before the retry).
-        client = Client({
-            "token": "tok",
-            "userId": "U001",
-            "email": "a@b.com",
-            "password": "pw",
-            "tokenExp": time.time() + 86400,
-        })
+        client = Client(
+            {
+                "token": "tok",
+                "userId": "U001",
+                "email": "a@b.com",
+                "password": "pw",
+                "tokenExp": time.time() + 86400,
+            }
+        )
         mock_data: dict[str, Any] = {"qrCodeId": "abc123", "userId": 1234567890}
         with aioresponses() as m:
             m.get(_QRCODE_URL, payload={"code": 10402, "msg": "Token expired"})
             # After 10402, tokenExp is set to 0 and _ensure_fresh_token calls _http_login
-            m.post(_LOGIN_URL, payload={
-                "code": 0, "token": "new-tok",
-                "data": {"userId": "U001", "mqttPassWord": "bXF0dHB3"},
-            })
+            m.post(
+                _LOGIN_URL,
+                payload={
+                    "code": 0,
+                    "token": "new-tok",
+                    "data": {"userId": "U001", "mqttPassWord": "bXF0dHB3"},
+                },
+            )
+            m.get(_QRCODE_URL, payload={"code": 0, "data": mock_data})
+            result = await client.generate_share_qrcode()
+
+        assert result["qrCodeId"] == "abc123"
+
+    async def test_retries_on_session_invalidated(self):
+        client = Client(
+            {
+                "token": "tok",
+                "userId": "U001",
+                "email": "a@b.com",
+                "password": "pw",
+                "tokenExp": time.time() + 86400,
+            }
+        )
+        mock_data: dict[str, Any] = {"qrCodeId": "abc123", "userId": 1234567890}
+        with aioresponses() as m:
+            m.get(_QRCODE_URL, payload={"code": 10600, "msg": "Auth failed"})
+            # _relogin calls _http_login
+            m.post(
+                _LOGIN_URL,
+                payload={
+                    "code": 0,
+                    "token": "new-tok",
+                    "data": {"userId": "U001", "mqttPassWord": "bXF0dHB3"},
+                },
+            )
             m.get(_QRCODE_URL, payload={"code": 0, "data": mock_data})
             result = await client.generate_share_qrcode()
 
