@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.4](https://github.com/jlopez/socketry/compare/socketry-v0.2.3...socketry-v0.2.4) (2026-03-31)
+
+
+### Features
+
+* **client:** add sharing QR code generation ([#42](https://github.com/jlopez/socketry/issues/42)) ([5696cd2](https://github.com/jlopez/socketry/commit/5696cd21495493b9073c513e518e09f8e326f75b))
+
 ## [0.2.3](https://github.com/jlopez/socketry/compare/socketry-v0.2.2...socketry-v0.2.3) (2026-03-02)
 
 
