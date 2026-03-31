@@ -5,6 +5,7 @@ from socketry.client import (
     Client,
     Device,
     MqttError,
+    ShareQrCode,
     SocketryError,
     Subscription,
 )
@@ -18,6 +19,7 @@ __all__ = [
     "MqttError",
     "PROPERTIES",
     "Setting",
+    "ShareQrCode",
     "SocketryError",
     "Subscription",
 ]

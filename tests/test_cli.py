@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -157,3 +158,46 @@ class TestWatchCommand:
 
         assert result.exit_code == 0
         assert "Disconnected, reconnecting" in result.output
+
+
+class TestShareQrCommand:
+    def test_displays_qr_code_info(self):
+        mock_data = {"qrCodeId": "abc123def456", "userId": 9876543210}
+
+        with (
+            patch.object(Client, "from_saved", return_value=Client(MOCK_CREDS)),
+            patch.object(
+                Client, "generate_share_qrcode", new_callable=AsyncMock, return_value=mock_data
+            ),
+        ):
+            result = runner.invoke(app, ["share-qr"])
+
+        assert result.exit_code == 0
+        assert "abc123def456" in result.output
+        assert "9876543210" in result.output
+        assert "5 minutes" in result.output
+
+    def test_json_output(self):
+        mock_data = {"qrCodeId": "abc123def456", "userId": 9876543210}
+
+        with (
+            patch.object(Client, "from_saved", return_value=Client(MOCK_CREDS)),
+            patch.object(
+                Client, "generate_share_qrcode", new_callable=AsyncMock, return_value=mock_data
+            ),
+        ):
+            result = runner.invoke(app, ["share-qr", "--json"])
+
+        assert result.exit_code == 0
+        parsed = json.loads(result.output)
+        assert parsed["qrCodeId"] == "abc123def456"
+
+    def test_empty_response(self):
+        with (
+            patch.object(Client, "from_saved", return_value=Client(MOCK_CREDS)),
+            patch.object(Client, "generate_share_qrcode", new_callable=AsyncMock, return_value={}),
+        ):
+            result = runner.invoke(app, ["share-qr"])
+
+        assert result.exit_code == 1
+        assert "Failed to generate QR code" in result.output

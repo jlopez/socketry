@@ -36,4 +36,8 @@ uv run socketry set light high --wait
 uv run socketry set light sos
 uv run socketry get light
 uv run socketry set light off
+
+# HTTP: sharing QR code generation
+uv run socketry share-qr
+uv run socketry share-qr --json
 ```

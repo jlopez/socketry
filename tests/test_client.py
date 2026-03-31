@@ -28,6 +28,7 @@ from socketry.client import (
     _decode_jwt_exp,
     _fetch_all_devices,
     _fetch_device_properties,
+    _generate_share_qrcode,
     _http_login,
     _make_tls_context,
     _mqtt_params,
@@ -40,6 +41,7 @@ from socketry.properties import Setting
 # Regex patterns for URL matching (aioresponses needs to match full URL with query params)
 _LOGIN_URL = re.compile(rf"^{re.escape(API_BASE)}/auth/login")
 _PROPERTY_URL = re.compile(rf"^{re.escape(API_BASE)}/device/property")
+_QRCODE_URL = re.compile(rf"^{re.escape(API_BASE)}/device/bind/qrcode")
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +253,50 @@ class TestFetchDeviceProperties:
         assert result == {}
 
 
+class TestGenerateShareQrcode:
+    async def test_success(self):
+        mock_data: dict[str, Any] = {
+            "qrCodeId": "abc123",
+            "userId": 1234567890,
+        }
+        with aioresponses() as m:
+            m.get(_QRCODE_URL, payload={"code": 0, "data": mock_data})
+            async with aiohttp.ClientSession() as session:
+                result = await _generate_share_qrcode("fake-token", "U001", session)
+
+        assert result["qrCodeId"] == "abc123"
+        assert result["userId"] == 1234567890
+
+    async def test_api_error_code(self):
+        with aioresponses() as m:
+            m.get(_QRCODE_URL, payload={"code": 10600, "msg": "Auth failed"})
+            async with aiohttp.ClientSession() as session:
+                with pytest.raises(_SessionInvalidatedError, match="QR code generation failed"):
+                    await _generate_share_qrcode("fake-token", "U001", session)
+
+    async def test_token_expired(self):
+        with aioresponses() as m:
+            m.get(_QRCODE_URL, payload={"code": 10402, "msg": "Token expired"})
+            async with aiohttp.ClientSession() as session:
+                with pytest.raises(TokenExpiredError):
+                    await _generate_share_qrcode("fake-token", "U001", session)
+
+    async def test_http_error(self):
+        with aioresponses() as m:
+            m.get(_QRCODE_URL, status=500)
+            async with aiohttp.ClientSession() as session:
+                with pytest.raises(aiohttp.ClientResponseError):
+                    await _generate_share_qrcode("fake-token", "U001", session)
+
+    async def test_empty_data(self):
+        with aioresponses() as m:
+            m.get(_QRCODE_URL, payload={"code": 0, "data": None})
+            async with aiohttp.ClientSession() as session:
+                result = await _generate_share_qrcode("fake-token", "U001", session)
+
+        assert not result
+
+
 class TestHttpLogin:
     async def test_successful_login(self):
         login_response = {
@@ -348,6 +394,78 @@ class TestClientFetchDevices:
         assert len(result) == 1
         assert client.devices == result
         assert result[0]["devSn"] == "SN001"
+
+
+class TestClientGenerateShareQrcode:
+    async def test_success(self):
+        client = Client({"token": "tok", "userId": "U001"})
+        mock_data: dict[str, Any] = {"qrCodeId": "abc123", "userId": 1234567890}
+        with aioresponses() as m:
+            m.get(_QRCODE_URL, payload={"code": 0, "data": mock_data})
+            result = await client.generate_share_qrcode()
+
+        assert result["qrCodeId"] == "abc123"
+
+    async def test_retries_on_token_expired(self):
+        # Use a far-future tokenExp so _ensure_fresh_token doesn't try to
+        # proactively refresh (which would hit _http_login before the retry).
+        client = Client(
+            {
+                "token": "tok",
+                "userId": "U001",
+                "email": "a@b.com",
+                "password": "pw",
+                "tokenExp": time.time() + 86400,
+            }
+        )
+        mock_data: dict[str, Any] = {"qrCodeId": "abc123", "userId": 1234567890}
+        with aioresponses() as m:
+            m.get(_QRCODE_URL, payload={"code": 10402, "msg": "Token expired"})
+            # After 10402, tokenExp is set to 0 and _ensure_fresh_token calls _http_login
+            m.post(
+                _LOGIN_URL,
+                payload={
+                    "code": 0,
+                    "token": "new-tok",
+                    "data": {"userId": "U001", "mqttPassWord": "bXF0dHB3"},
+                },
+            )
+            m.get(_QRCODE_URL, payload={"code": 0, "data": mock_data})
+            result = await client.generate_share_qrcode()
+
+        assert result["qrCodeId"] == "abc123"
+
+    async def test_retries_on_session_invalidated(self):
+        client = Client(
+            {
+                "token": "tok",
+                "userId": "U001",
+                "email": "a@b.com",
+                "password": "pw",
+                "tokenExp": time.time() + 86400,
+            }
+        )
+        mock_data: dict[str, Any] = {"qrCodeId": "abc123", "userId": 1234567890}
+        with aioresponses() as m:
+            m.get(_QRCODE_URL, payload={"code": 10600, "msg": "Auth failed"})
+            # _relogin calls _http_login
+            m.post(
+                _LOGIN_URL,
+                payload={
+                    "code": 0,
+                    "token": "new-tok",
+                    "data": {"userId": "U001", "mqttPassWord": "bXF0dHB3"},
+                },
+            )
+            m.get(_QRCODE_URL, payload={"code": 0, "data": mock_data})
+            result = await client.generate_share_qrcode()
+
+        assert result["qrCodeId"] == "abc123"
+
+    async def test_raises_without_user_id(self):
+        client = Client({"token": "tok"})
+        with pytest.raises(ValueError, match="No userId"):
+            await client.generate_share_qrcode()
 
 
 class TestClientGetAllProperties:

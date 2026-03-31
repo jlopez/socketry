@@ -104,6 +104,29 @@ def devices() -> None:
     typer.echo("\n  * = selected.  Use `socketry select <index>` to change.")
 
 
+@app.command("share-qr")
+def share_qr(
+    as_json: bool = typer.Option(False, "--json", "-j", help="Output as JSON"),
+) -> None:
+    """Generate a sharing QR code.
+
+    \b
+    Another Jackery user can scan this QR code (in the Jackery app)
+    to gain access to your shared devices. The code expires after 5 minutes.
+    """
+    client = _ensure_client()
+    data = asyncio.run(client.generate_share_qrcode())
+    if not data:
+        typer.echo("Failed to generate QR code.", err=True)
+        raise typer.Exit(1)
+    if as_json:
+        _print_json(data)
+    else:
+        typer.echo(f"QR Code ID: {data.get('qrCodeId', 'unknown')}")
+        typer.echo(f"User ID:    {data.get('userId', 'unknown')}")
+        typer.echo("\nExpires in 5 minutes.")
+
+
 @app.command()
 def select(index: int) -> None:
     """Select the active device by index (see ``devices`` for the list)."""
